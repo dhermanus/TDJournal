@@ -17,6 +17,9 @@ import httpx
 
 from database import init_db, get_db, row_to_dict
 from csv_parser import parse_broker_csv, FUTURES_MULTIPLIERS, MT5_INSTRUMENT_TYPES
+import csv_parser
+import mt5_bars
+from excursions import recalc_excursions
 from ai_analysis import (
     analyze_diary_entry,
     analyze_diary_text,
@@ -497,13 +500,51 @@ async def import_csv(
         conn.rollback()
         raise
 
+    message = (f"Imported {imported} trade group(s). "
+               f"Skipped {skipped} duplicate execution(s).")
+
+    # MT5 trades: measure MFE / MAE from the exported bars, when there are any. A problem here
+    # must never fail an import that has already been saved.
+    excursions = None
+    fx_groups = [t['trade_group'] for t in trades if t.get('instrument_type') in MT5_INSTRUMENT_TYPES]
+    if fx_groups:
+        try:
+            excursions = recalc_excursions(conn, account_id, fx_groups)
+            conn.commit()
+            if excursions['computed']:
+                message += f" Measured MFE/MAE for {excursions['computed']} trade(s) from the MT5 bars."
+        except Exception:
+            conn.rollback()
+
     return {
         "imported": imported,
         "skipped": skipped,
         "errors": errors,
-        "message": (f"Imported {imported} trade group(s). "
-                    f"Skipped {skipped} duplicate execution(s)."),
+        "excursions": excursions,
+        "message": message,
     }
+
+
+@app.post("/api/mt5/recalculate-excursions")
+def mt5_recalculate_excursions(
+    account_id: int | None = Query(None),
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Re-measure MFE / MAE for MT5 trades, e.g. after exporting or refreshing the bars."""
+    stats = recalc_excursions(conn, account_id)
+    conn.commit()
+    parts = [f"Measured {stats['computed']} trade(s)."]
+    if stats['no_bars']:
+        parts.append(f"{stats['no_bars']} have no bars for their hold time (export the bars again with a wider range).")
+    if stats['close_by']:
+        parts.append(f"{stats['close_by']} closed by MT5 'close by' are skipped.")
+    if stats['open']:
+        parts.append(f"{stats['open']} are still open.")
+    if stats['reimport']:
+        parts.append(f"{stats['reimport']} need the deal CSV imported again first.")
+    if stats['no_pips']:
+        parts.append(f"{stats['no_pips']} have no pip size.")
+    return {**stats, "message": " ".join(parts)}
 
 
 # ── Trades ─────────────────────────────────────────────────────────────────────
@@ -1320,12 +1361,57 @@ async def _fetch_alpaca_bars(client, url, base_params, headers, max_bars=5000):
     return bars
 
 
+def _mt5_chart(ticker: str, date: str, timeframe: str, days_back: int) -> dict:
+    """Chart bars for an MT5 symbol from the exported M1 files.
+
+    The trade's date is a day in the display time zone (Jakarta by default), so the window is
+    that whole local day, a full 24 hours, not a stock session. Bar times go out as UTC ISO
+    strings, like the Alpaca route; display_timezone tells the chart which zone the trade's
+    stored execution times are in.
+    """
+    from datetime import timezone as _tz
+    from zoneinfo import ZoneInfo
+    symbol = ticker.upper()
+    tf = timeframe if timeframe in ALLOWED_CHART_TIMEFRAMES else "5Min"
+    zone_name = csv_parser.display_timezone_name()
+    zone = ZoneInfo(zone_name)
+    trade_day = datetime.strptime(date, "%Y-%m-%d")
+
+    if tf in _WIDE_RANGE_TIMEFRAMES:
+        days_back = min(days_back, {"1Day": 3650, "1Week": 5475}[tf])
+        start_local = trade_day - timedelta(days=days_back - 1)
+        end_local = trade_day + timedelta(days=11)
+    else:
+        days_back = min(days_back, 90)
+        start_local = trade_day - timedelta(days=days_back - 1)
+        end_local = trade_day + timedelta(days=1)
+    start_utc = start_local.replace(tzinfo=zone).astimezone(_tz.utc)
+    end_utc = end_local.replace(tzinfo=zone).astimezone(_tz.utc)
+
+    result = {"ticker": symbol, "original_ticker": ticker, "date": date, "bars": [],
+              "source": "mt5", "display_timezone": zone_name}
+    bars = mt5_bars.get_bars(symbol, start_utc, end_utc, tf)
+    if bars is None:
+        result["warning"] = mt5_bars.no_data_hint(symbol)
+    elif not bars:
+        result["warning"] = (f"The exported MT5 bars for {symbol} do not cover {date}. "
+                             "Run ExportBarsCSV.mq5 again with a range that includes it.")
+    else:
+        result["bars"] = bars
+    return result
+
+
 @app.get("/api/chart/{ticker}/{date}")
 async def get_chart(
     ticker: str, date: str,
     timeframe: str = Query("5Min"),
     days_back: int = Query(1, ge=1),
+    conn: sqlite3.Connection = Depends(get_connection),
 ):
+    # A symbol the MT5 importer has seen is charted from its exported bars, not from Alpaca.
+    if conn.execute("SELECT 1 FROM symbol_specs WHERE symbol = ? LIMIT 1", (ticker.upper(),)).fetchone():
+        return _mt5_chart(ticker, date, timeframe, days_back)
+
     if not ALPACA_KEY or ALPACA_KEY == "your_alpaca_api_key_here":
         return {
             "ticker": ticker, "date": date, "bars": [],

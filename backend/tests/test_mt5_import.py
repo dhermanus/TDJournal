@@ -32,6 +32,11 @@ FIXTURE = (BACKEND / 'tests' / 'fixtures' / 'mt5_sample.csv').read_text()
 
 
 def tearDownModule():
+    # Leave nothing behind in the environment: the app reads these variables when it is imported, so a
+    # later test module that re-imports it (test_reimport.py does) would otherwise find a deleted folder.
+    for key in ('DATABASE_PATH', 'UPLOAD_DIR'):
+        if os.environ.get(key, '').startswith(_TMP.name):
+            os.environ.pop(key)
     _TMP.cleanup()
 
 

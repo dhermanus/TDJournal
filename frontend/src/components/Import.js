@@ -169,6 +169,8 @@ export default function Import({ accounts, accountId }) {
   const [importing, setImporting] = useState(false);
   const [csvResult, setCsvResult] = useState(null);
   const [csvError, setCsvError] = useState(null);
+  const [fxBusy, setFxBusy] = useState(false);
+  const [fxResult, setFxResult] = useState(null);
 
   // Diary upload state
   const [diaryFile, setDiaryFile] = useState(null);
@@ -177,6 +179,20 @@ export default function Import({ accounts, accountId }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [diaryResult, setDiaryResult] = useState(null);
   const [diaryError, setDiaryError] = useState(null);
+
+  // MetaTrader 5: measure MFE / MAE from the exported M1 bars (see scripts/mt5/ExportBarsCSV.mq5).
+  const handleRecalcFx = async () => {
+    setFxBusy(true);
+    setFxResult(null);
+    try {
+      const res = await importApi.recalcExcursions(csvAccountId || null);
+      setFxResult({ ok: true, text: res.data.message });
+    } catch (e) {
+      setFxResult({ ok: false, text: e.response?.data?.error || e.message });
+    } finally {
+      setFxBusy(false);
+    }
+  };
 
   const handleCsvImport = async () => {
     if (!csvFile || !csvAccountId) {
@@ -315,6 +331,27 @@ export default function Import({ accounts, accountId }) {
           <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-secondary)' }}>
             {BROKER_HELP[csvBroker]}
           </div>
+
+          {csvBroker === 'mt5' && (
+            <div className="notice" style={{ marginTop: 16, display: 'block' }}>
+              <div style={{ fontSize: 13.5, color: 'var(--text-primary)', fontWeight: 600, marginBottom: 4 }}>
+                FX charts and MFE / MAE
+              </div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 10 }}>
+                Run <em>ExportBarsCSV.mq5</em> in MetaTrader 5, put the folder it prints in
+                <em> MT5_BARS_DIR</em> in <em>backend/.env</em>, then measure your trades.
+                This also runs automatically after each MT5 import.
+              </div>
+              <button className="btn" onClick={handleRecalcFx} disabled={fxBusy}>
+                {fxBusy ? 'Measuring...' : 'Recalculate FX excursions'}
+              </button>
+              {fxResult && (
+                <div role="status" style={{ marginTop: 8, fontSize: 13, color: fxResult.ok ? 'var(--result-pos)' : 'var(--result-neg)' }}>
+                  {fxResult.text}
+                </div>
+              )}
+            </div>
+          )}
 
           <GenericTemplateTip open={csvBroker === 'generic'} onUse={() => setCsvBroker('generic')} />
         </section>

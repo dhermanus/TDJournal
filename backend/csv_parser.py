@@ -1533,34 +1533,60 @@ def normalize_mt5_symbol(symbol: str, instrument_type: str) -> str:
     return s
 
 
-def mt5_server_to_display(server_time: datetime) -> datetime:
-    """Convert a naive MT5 server timestamp to a naive timestamp in the display zone.
+def _mt5_time_zones():
+    """(server-time rule, display zone), read from the environment each call.
 
-    MT5_SERVER_TIME_RULE (env) says how the broker's server clock relates to real time:
+    MT5_SERVER_TIME_RULE says how the broker's server clock relates to real time:
       'ny+7'        New York time plus 7 hours: GMT+2 in winter, GMT+3 in summer. This is the
                     default and what IC Markets uses.
       'utc+N'       a fixed offset, e.g. 'utc+2'.
       an IANA zone  e.g. 'Europe/Athens', for brokers on EET with European daylight saving.
-    DISPLAY_TIMEZONE (env, default Asia/Jakarta) is the zone stored and shown in the app.
+    DISPLAY_TIMEZONE (default Asia/Jakarta) is the zone stored and shown in the app.
     """
     try:
         from zoneinfo import ZoneInfo
         raw_rule = (os.getenv('MT5_SERVER_TIME_RULE') or 'ny+7').strip()
-        rule = raw_rule.lower()
         display = ZoneInfo((os.getenv('DISPLAY_TIMEZONE') or 'Asia/Jakarta').strip())
+        rule = raw_rule.lower()
         if rule == 'ny+7':
-            aware = (server_time - timedelta(hours=7)).replace(tzinfo=ZoneInfo('America/New_York'))
-        elif re.fullmatch(r'utc[+-]\d{1,2}(\.\d+)?', rule):
-            aware = (server_time - timedelta(hours=float(rule[3:]))).replace(tzinfo=timezone.utc)
-        else:
-            aware = server_time.replace(tzinfo=ZoneInfo(raw_rule))
+            return ('ny+7', ZoneInfo('America/New_York')), display
+        if re.fullmatch(r'utc[+-]\d{1,2}(\.\d+)?', rule):
+            return ('utc', float(rule[3:])), display
+        return ('zone', ZoneInfo(raw_rule)), display
     except Exception as exc:  # ZoneInfoNotFoundError on Windows without the tzdata package
         raise ValueError(
             "Could not load time-zone data for the MT5 import "
             f"({type(exc).__name__}: {exc}). Run 'pip install tzdata' in the backend "
             "environment, and check MT5_SERVER_TIME_RULE / DISPLAY_TIMEZONE in backend/.env."
         )
-    return aware.astimezone(display).replace(tzinfo=None)
+
+
+def mt5_server_to_utc(server_time: datetime) -> datetime:
+    """Naive MT5 server timestamp -> timezone-aware UTC datetime."""
+    (kind, zone), _display = _mt5_time_zones()
+    if kind == 'ny+7':
+        aware = (server_time - timedelta(hours=7)).replace(tzinfo=zone)
+    elif kind == 'utc':
+        aware = (server_time - timedelta(hours=zone)).replace(tzinfo=timezone.utc)
+    else:
+        aware = server_time.replace(tzinfo=zone)
+    return aware.astimezone(timezone.utc)
+
+
+def mt5_server_to_display(server_time: datetime) -> datetime:
+    """Naive MT5 server timestamp -> naive timestamp in the display zone (what the app stores)."""
+    _rule, display = _mt5_time_zones()
+    return mt5_server_to_utc(server_time).astimezone(display).replace(tzinfo=None)
+
+
+def display_to_utc(local_time: datetime) -> datetime:
+    """Naive timestamp in the display zone (as stored on trades) -> timezone-aware UTC."""
+    _rule, display = _mt5_time_zones()
+    return local_time.replace(tzinfo=display).astimezone(timezone.utc)
+
+
+def display_timezone_name() -> str:
+    return (os.getenv('DISPLAY_TIMEZONE') or 'Asia/Jakarta').strip()
 
 
 def _mt5_time(value: str) -> datetime | None:
@@ -1771,6 +1797,7 @@ def build_mt5_trades(deals: list[dict], account_id: int, conn=None) -> tuple[lis
             'price': d['price'],
             'commission': round(-(d['commission'] + d['fee']), 2),
             'deal_ticket': d['ticket'],
+            'entry': d['entry'],
             'swap': d['swap'],
             'profit': d['profit'],
         } for d in group])

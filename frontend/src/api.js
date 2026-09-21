@@ -35,6 +35,10 @@ export const importApi = {
   importCsv: (formData) => api.post('/api/import-csv', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
+  // Re-measure MFE / MAE for MetaTrader 5 trades from the exported M1 bars.
+  recalcExcursions: (accountId) => api.post('/api/mt5/recalculate-excursions', null, {
+    params: accountId ? { account_id: accountId } : {}
+  }),
   uploadDiary: (formData) => api.post('/api/upload-diary', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
