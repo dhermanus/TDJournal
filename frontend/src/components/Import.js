@@ -9,6 +9,7 @@ const BROKERS = [
   { value: 'auto', label: 'Auto-detect' },
   { value: 'thinkorswim', label: 'Thinkorswim (Schwab)' },
   { value: 'ibkr', label: 'Interactive Brokers (IBKR)' },
+  { value: 'mt5', label: 'MetaTrader 5 (FX, metals, indices, crypto)' },
   { value: 'generic', label: 'Other broker (generic template)' },
 ];
 
@@ -17,16 +18,18 @@ const TEMPLATE_URL = '/templates/generic_trades_template.csv';
 const EXAMPLE_URL = '/templates/generic_trades_example.csv';
 
 const BROKER_HELP = {
-  auto: 'Pick a broker above, or leave Auto-detect and the importer will recognise a Thinkorswim account statement or an IBKR Activity Statement.',
+  auto: 'Pick a broker above, or leave Auto-detect and the importer will recognise a Thinkorswim account statement, an IBKR Activity Statement or a MetaTrader 5 deal export.',
   thinkorswim: <>Export from Thinkorswim desktop: <em>Monitor → Account Statement → export icon → Export to File (CSV)</em></>,
   ibkr: <>Export from IBKR Client Portal: <em>Performance &amp; Reports → Statements → Activity → pick the period → Download as CSV</em></>,
+  mt5: <>In MetaTrader 5 run the <em>ExportDealsCSV</em> script (<em>scripts/mt5/ExportDealsCSV.mq5</em>: copy it to <em>MQL5/Scripts</em>, compile, drag it onto a chart). It writes a CSV into the <em>MQL5/Files</em> folder of the terminal. Each MT5 position becomes one trade, so hedged positions stay separate; times are converted to your display time zone. Use one journal account per MT5 account, since every MT5 account has a single currency.</>,
   generic: <>Copy your fills into the template, one row per execution. Buys and sells of the same symbol are grouped into round-trip trades automatically, the same way as a broker import.</>,
 };
 
 const BROKER_DROP_LABEL = {
-  auto: 'Drop your broker CSV (Thinkorswim or IBKR)',
+  auto: 'Drop your broker CSV (Thinkorswim, IBKR or MetaTrader 5)',
   thinkorswim: 'Drop Thinkorswim account statement CSV',
   ibkr: 'Drop IBKR Activity Statement CSV',
+  mt5: 'Drop MetaTrader 5 deal export CSV',
   generic: 'Drop your filled-in generic template CSV',
 };
 
@@ -35,6 +38,7 @@ function brokerFromAccount(account) {
   const b = (account?.broker || '').toLowerCase();
   if (/ibkr|interactive/.test(b)) return 'ibkr';
   if (/thinkorswim|tos|schwab/.test(b)) return 'thinkorswim';
+  if (/mt5|metatrader|ic ?markets|icmarkets/.test(b)) return 'mt5';
   return 'auto';
 }
 

@@ -2,7 +2,8 @@ import re
 import json
 import csv
 import io
-from datetime import datetime
+import os
+from datetime import datetime, timedelta, timezone
 
 
 MONTH_MAP = {
@@ -1465,17 +1466,413 @@ def parse_generic_csv(content, account_id, conn=None):
     return build_trades_from_executions(parse_generic_rows(content), account_id, conn)
 
 
+# ── MetaTrader 5 (deal export from scripts/mt5/ExportDealsCSV.mq5) ────────────
+#
+# MT5 has no CSV export of its own, so the journal ships an MQL5 script that writes
+# one row per deal:
+#
+#   deal_ticket,position_id,time,symbol,type,entry,volume,price,commission,fee,swap,
+#   profit,magic,comment,account_currency,server,symbol_path,digits,point,contract_size
+#
+# Unlike the stock and futures importers, MT5 already tells us which deals belong to
+# which position (position_id), and a hedging account can hold several positions in
+# one symbol at once. Netting by "position returns to zero" would merge or mis-pair
+# them, so this path skips build_trades_from_executions entirely: each position is one
+# trade, keyed by its ticket, so re-importing the same file updates rather than
+# duplicates (and diary notes and tags stay attached when a position later closes).
+#
+# P&L is MT5's own: profit is already in the account currency, commission and fee are
+# costs (negative in MT5), swap is signed. Times arrive in broker server time and are
+# converted to the display time zone (default Asia/Jakarta) at import.
+
+MT5_INSTRUMENT_TYPES = {'FOREX', 'METAL', 'INDEX', 'CRYPTO', 'COMMODITY', 'SHARE_CFD', 'OTHER'}
+
+MT5_REQUIRED = ('deal_ticket', 'position_id', 'time', 'symbol', 'type', 'entry', 'volume', 'price')
+
+_FX_CURRENCIES = {
+    'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF', 'SEK', 'NOK', 'DKK', 'SGD',
+    'HKD', 'MXN', 'ZAR', 'TRY', 'PLN', 'CZK', 'HUF', 'CNH', 'CNY', 'ILS', 'THB', 'RON',
+}
+
+# First match wins, so "Stock Indices" lands in INDEX before it can look like SHARE_CFD.
+# Words are matched against the tokens of the symbol's MT5 category path
+# (e.g. "Forex\Majors\EURUSD", "Metals\XAUUSD", "Indices\US500", "Crypto\BTCUSD").
+_MT5_CLASS_RULES = [
+    ('FOREX', {'forex', 'fx', 'currency', 'currencies'}),
+    ('METAL', {'metal', 'metals', 'gold', 'silver', 'precious'}),
+    ('INDEX', {'index', 'indices', 'indexes'}),
+    ('CRYPTO', {'crypto', 'cryptos', 'cryptocurrency', 'cryptocurrencies'}),
+    ('COMMODITY', {'commodity', 'commodities', 'energy', 'energies', 'oil', 'softs',
+                   'agricultural', 'agriculturals'}),
+    ('SHARE_CFD', {'share', 'shares', 'stock', 'stocks', 'equity', 'equities', 'etf', 'etfs'}),
+]
+
+
+def classify_mt5_instrument(symbol: str, path: str = '') -> str:
+    """Sort an MT5 symbol into an instrument class. Unrecognised symbols become OTHER
+    (their category path is kept in symbol_specs so the rules above can be extended)."""
+    tokens = set(re.split(r'[^a-z0-9]+', (path or '').lower())) - {''}
+    for instr, words in _MT5_CLASS_RULES:
+        if tokens & words:
+            return instr
+    s = symbol.strip().upper()
+    if s[:3] in _FX_CURRENCIES and s[3:6] in _FX_CURRENCIES and len(s) >= 6:
+        return 'FOREX'
+    if s[:3] in ('XAU', 'XAG', 'XPT', 'XPD'):
+        return 'METAL'
+    return 'OTHER'
+
+
+def normalize_mt5_symbol(symbol: str, instrument_type: str) -> str:
+    """Upper-case; for FX pairs drop broker suffixes (EURUSD.m, EURUSDm -> EURUSD)."""
+    s = symbol.strip().upper()
+    if instrument_type == 'FOREX':
+        m = re.match(r'^([A-Z]{3})([A-Z]{3})', s)
+        if m and m.group(1) in _FX_CURRENCIES and m.group(2) in _FX_CURRENCIES:
+            return m.group(1) + m.group(2)
+    return s
+
+
+def mt5_server_to_display(server_time: datetime) -> datetime:
+    """Convert a naive MT5 server timestamp to a naive timestamp in the display zone.
+
+    MT5_SERVER_TIME_RULE (env) says how the broker's server clock relates to real time:
+      'ny+7'        New York time plus 7 hours: GMT+2 in winter, GMT+3 in summer. This is the
+                    default and what IC Markets uses.
+      'utc+N'       a fixed offset, e.g. 'utc+2'.
+      an IANA zone  e.g. 'Europe/Athens', for brokers on EET with European daylight saving.
+    DISPLAY_TIMEZONE (env, default Asia/Jakarta) is the zone stored and shown in the app.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        raw_rule = (os.getenv('MT5_SERVER_TIME_RULE') or 'ny+7').strip()
+        rule = raw_rule.lower()
+        display = ZoneInfo((os.getenv('DISPLAY_TIMEZONE') or 'Asia/Jakarta').strip())
+        if rule == 'ny+7':
+            aware = (server_time - timedelta(hours=7)).replace(tzinfo=ZoneInfo('America/New_York'))
+        elif re.fullmatch(r'utc[+-]\d{1,2}(\.\d+)?', rule):
+            aware = (server_time - timedelta(hours=float(rule[3:]))).replace(tzinfo=timezone.utc)
+        else:
+            aware = server_time.replace(tzinfo=ZoneInfo(raw_rule))
+    except Exception as exc:  # ZoneInfoNotFoundError on Windows without the tzdata package
+        raise ValueError(
+            "Could not load time-zone data for the MT5 import "
+            f"({type(exc).__name__}: {exc}). Run 'pip install tzdata' in the backend "
+            "environment, and check MT5_SERVER_TIME_RULE / DISPLAY_TIMEZONE in backend/.env."
+        )
+    return aware.astimezone(display).replace(tzinfo=None)
+
+
+def _mt5_time(value: str) -> datetime | None:
+    v = (value or '').strip()
+    for fmt in ('%Y.%m.%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y.%m.%d %H:%M', '%Y-%m-%d %H:%M'):
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _mt5_number(value: str, default=None):
+    """Blank -> default; anything unreadable raises ValueError."""
+    v = (value or '').strip()
+    if v == '':
+        return default
+    return float(v)
+
+
+def _mt5_qty(x: float):
+    return int(x) if x == int(x) else round(x, 6)
+
+
+def parse_mt5_rows(content: str) -> list[dict]:
+    """Read the export into deal dicts. Raises ValueError naming every unreadable row.
+
+    Rows whose type is not buy/sell (balance, credit, charge...) are not trades and are
+    ignored; the export script does not write them anyway.
+    """
+    reader = csv.reader(io.StringIO(content.lstrip('\ufeff')))
+    header = None
+    for cells in reader:
+        if any(c.strip() for c in cells):
+            header = [c.strip().lower() for c in cells]
+            break
+    if header is None:
+        raise ValueError("The file is empty.")
+    col = {}
+    for i, name in enumerate(header):
+        col.setdefault(name, i)
+    missing = [c for c in MT5_REQUIRED if c not in col]
+    if missing:
+        raise ValueError(
+            "This does not look like the MT5 deal export. Missing column(s): "
+            + ", ".join(missing) + ". Run scripts/mt5/ExportDealsCSV.mq5 in MetaTrader 5."
+        )
+
+    def cell(cells, name):
+        i = col.get(name)
+        return cells[i].strip() if i is not None and i < len(cells) else ''
+
+    deals, problems = [], []
+    for cells in reader:
+        n = reader.line_num
+        if not any(c.strip() for c in cells):
+            continue
+        dtype = cell(cells, 'type').lower()
+        if dtype not in ('buy', 'sell'):
+            continue
+        why = []
+        ticket = cell(cells, 'deal_ticket')
+        position_id = cell(cells, 'position_id')
+        server_time = _mt5_time(cell(cells, 'time'))
+        symbol = cell(cells, 'symbol')
+        entry = cell(cells, 'entry').lower().replace(' ', '_')
+        if not ticket:
+            why.append("deal_ticket is empty")
+        if server_time is None:
+            why.append(f"time '{cell(cells, 'time')}' is not YYYY.MM.DD HH:MM:SS")
+        if not symbol:
+            why.append("symbol is empty")
+        if entry not in ('in', 'out', 'out_by', 'inout'):
+            why.append(f"entry '{cell(cells, 'entry')}' is not in, out, out_by or inout")
+        nums = {}
+        for name, default in (('volume', None), ('price', None), ('commission', 0.0),
+                              ('fee', 0.0), ('swap', 0.0), ('profit', 0.0),
+                              ('digits', None), ('point', None), ('contract_size', None)):
+            try:
+                nums[name] = _mt5_number(cell(cells, name), default)
+            except ValueError:
+                why.append(f"{name} '{cell(cells, name)}' is not a number")
+        if nums.get('volume') is None or (nums.get('volume') or 0) <= 0:
+            why.append(f"volume '{cell(cells, 'volume')}' is not a number above zero")
+        if nums.get('price') is None:
+            why.append(f"price '{cell(cells, 'price')}' is not a number")
+        if why:
+            problems.append(f"line {n}: " + "; ".join(why))
+            continue
+        if not position_id or position_id == '0':
+            position_id = 'deal' + ticket  # a deal without a position stands alone
+        deals.append({
+            'ticket': ticket, 'position_id': position_id, 'server_time': server_time,
+            'symbol': symbol, 'type': dtype, 'entry': entry,
+            'volume': nums['volume'], 'price': nums['price'],
+            'commission': nums['commission'], 'fee': nums['fee'],
+            'swap': nums['swap'], 'profit': nums['profit'],
+            'currency': cell(cells, 'account_currency').upper(),
+            'path': cell(cells, 'symbol_path'),
+            'digits': int(nums['digits']) if nums['digits'] is not None else None,
+            'point': nums['point'], 'contract_size': nums['contract_size'],
+        })
+
+    if problems:
+        more = f" (and {len(problems) - 8} more)" if len(problems) > 8 else ""
+        raise ValueError(
+            f"{len(problems)} row(s) could not be read, so nothing was imported{more}. "
+            + " | ".join(problems[:8])
+        )
+    if not deals:
+        raise ValueError("The file has no buy/sell deals.")
+    return deals
+
+
+def _mt5_unit(instr: str, symbol: str, digits, point):
+    """Size of one pip (FOREX) or one point (everything else), or None if unknown."""
+    if instr == 'FOREX':
+        if point and digits in (3, 5):
+            return round(point * 10, 10)
+        if point and digits in (2, 4):
+            return point
+        return 0.01 if symbol.endswith('JPY') else 0.0001
+    return point or None
+
+
+def build_mt5_trades(deals: list[dict], account_id: int, conn=None) -> tuple[list[dict], dict, int]:
+    """Group deals by position ticket into trades.
+
+    Returns (trades, symbol_specs keyed by normalised symbol, skipped). Pure apart from
+    reading the DB to skip positions that are already stored unchanged.
+    """
+    skipped = 0
+
+    # A deal ticket is unique in MT5, so a repeated ticket really is a repeat.
+    seen, unique = set(), []
+    for d in deals:
+        if d['ticket'] in seen:
+            skipped += 1
+            continue
+        seen.add(d['ticket'])
+        unique.append(d)
+
+    if any(d['entry'] == 'inout' for d in unique):
+        raise ValueError(
+            "The file has a reversal deal (entry 'inout'), which only occurs on netting "
+            "accounts. This importer supports hedging accounts."
+        )
+
+    # Symbol classes and specs
+    specs: dict[str, dict] = {}
+    for d in unique:
+        instr = classify_mt5_instrument(d['symbol'], d['path'])
+        d['instrument_type'] = instr
+        d['ticker'] = normalize_mt5_symbol(d['symbol'], instr)
+        s = specs.setdefault(d['ticker'], {
+            'instrument_type': instr, 'category_path': None,
+            'digits': None, 'point': None, 'contract_size': None,
+        })
+        for key, val in (('category_path', d['path'] or None), ('digits', d['digits']),
+                         ('point', d['point']), ('contract_size', d['contract_size'])):
+            if val is not None:
+                s[key] = val
+        d['local'] = mt5_server_to_display(d['server_time'])
+
+    by_position: dict[str, list[dict]] = {}
+    for d in sorted(unique, key=lambda x: (x['server_time'], int(x['ticket']) if x['ticket'].isdigit() else 0)):
+        by_position.setdefault(d['position_id'], []).append(d)
+
+    trades = []
+    for position_id, group in by_position.items():
+        ins = [d for d in group if d['entry'] == 'in']
+        outs = [d for d in group if d['entry'] in ('out', 'out_by')]
+        ticker = group[0]['ticker']
+        instr = group[0]['instrument_type']
+
+        if ins:
+            side = 'LONG' if ins[0]['type'] == 'buy' else 'SHORT'
+        else:  # entry deal is before the exported range; a sell closes a long
+            side = 'LONG' if outs[0]['type'] == 'sell' else 'SHORT'
+
+        vol_in = sum(d['volume'] for d in ins)
+        vol_out = sum(d['volume'] for d in outs)
+        closed = bool(outs) and (not ins or abs(vol_in - vol_out) < 1e-6)
+
+        commissions = round(-sum(d['commission'] + d['fee'] for d in group), 2)
+        swap = round(sum(d['swap'] for d in group), 2)
+        if closed:
+            gross = round(sum(d['profit'] for d in group), 2)
+            net = round(gross - commissions + swap, 2)
+        else:  # open: nothing realised yet, same convention as the other importers
+            gross = net = 0.0
+
+        pips = None
+        if closed and ins:
+            spec = specs[ticker]
+            unit = _mt5_unit(instr, ticker, spec['digits'], spec['point'])
+            if unit:
+                avg_in = sum(d['price'] * d['volume'] for d in ins) / vol_in
+                avg_out = sum(d['price'] * d['volume'] for d in outs) / vol_out
+                direction = 1 if side == 'LONG' else -1
+                pips = round(direction * (avg_out - avg_in) / unit, 1)
+
+        executions = json.dumps([{
+            'date': d['local'].strftime('%Y-%m-%d'),
+            'time': d['local'].strftime('%H:%M:%S'),
+            'action': 'BOT' if d['type'] == 'buy' else 'SOLD',
+            'qty': _mt5_qty(d['volume']),
+            'price': d['price'],
+            'commission': round(-(d['commission'] + d['fee']), 2),
+            'deal_ticket': d['ticket'],
+            'swap': d['swap'],
+            'profit': d['profit'],
+        } for d in group])
+
+        # Closed trades belong to the day of the last exit; open ones to their latest deal.
+        anchor = (outs[-1] if closed else group[-1])['local']
+        trade = {
+            'account_id': account_id,
+            'trade_group': f"MT5_{ticker}_{position_id}",
+            'date': anchor.strftime('%Y-%m-%d'),
+            'ticker': ticker,
+            'instrument_type': instr,
+            'side': side,
+            'gross_pnl': gross,
+            'net_pnl': net,
+            'commissions': commissions,
+            'executions': executions,
+            'option_expiry': None, 'option_strike': None, 'option_type': None,
+            'source': 'imported',
+            'replaces': [],
+            'swap': swap,
+            'position_id': position_id,
+            'pips': pips,
+        }
+
+        if conn is not None:
+            row = conn.execute(
+                "SELECT executions, net_pnl, swap, instrument_type FROM trades "
+                "WHERE account_id = ? AND trade_group = ?",
+                (account_id, trade['trade_group']),
+            ).fetchone()
+            if (row and row[0] == executions and abs((row[1] or 0) - net) < 0.005
+                    and abs((row[2] or 0) - swap) < 0.005 and row[3] == instr):
+                skipped += len(group)  # stored already, identical: leave it (and its notes) alone
+                continue
+        trades.append(trade)
+
+    return trades, specs, skipped
+
+
+def parse_mt5_csv(content: str, account_id: int, conn=None) -> tuple[list[dict], int]:
+    """MT5 deal export pipeline. Same output contract as the other broker parsers."""
+    deals = parse_mt5_rows(content)
+
+    currencies = {d['currency'] for d in deals if d['currency']}
+    if len(currencies) > 1:
+        raise ValueError(
+            "The file mixes account currencies (" + ", ".join(sorted(currencies)) + "). "
+            "Export one MT5 account at a time."
+        )
+    file_currency = next(iter(currencies), None)
+
+    trades, specs, skipped = build_mt5_trades(deals, account_id, conn)
+
+    if conn is not None:
+        if file_currency:
+            row = conn.execute("SELECT currency FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            account_currency = ((row[0] if row else None) or 'USD').upper()
+            if file_currency != account_currency:
+                stored = conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE account_id = ?", (account_id,)
+                ).fetchone()[0]
+                if stored == 0:
+                    # An account with no trades yet simply takes the MT5 account's currency.
+                    conn.execute("UPDATE accounts SET currency = ? WHERE id = ?", (file_currency, account_id))
+                else:
+                    raise ValueError(
+                        f"This file is in {file_currency}, but the selected journal account is in "
+                        f"{account_currency}. Import it into a separate account so totals never "
+                        "mix currencies."
+                    )
+        for symbol, s in specs.items():
+            conn.execute(
+                """INSERT INTO symbol_specs
+                       (account_id, symbol, instrument_type, category_path, digits, point, contract_size)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(account_id, symbol) DO UPDATE SET
+                       instrument_type=excluded.instrument_type,
+                       category_path=COALESCE(excluded.category_path, category_path),
+                       digits=COALESCE(excluded.digits, digits),
+                       point=COALESCE(excluded.point, point),
+                       contract_size=COALESCE(excluded.contract_size, contract_size),
+                       updated_at=datetime('now')""",
+                (account_id, symbol, s['instrument_type'], s['category_path'],
+                 s['digits'], s['point'], s['contract_size']),
+            )
+    return trades, skipped
+
+
 # ── Broker dispatch ────────────────────────────────────────────────────────────
 
 BROKER_PARSERS = {
     'thinkorswim': parse_thinkorswim_csv,
     'ibkr': parse_ibkr_csv,
+    'mt5': parse_mt5_csv,
     'generic': parse_generic_csv,
 }
 
 BROKER_LABELS = {
     'thinkorswim': 'Thinkorswim',
     'ibkr': 'Interactive Brokers',
+    'mt5': 'MetaTrader 5',
     'generic': 'the generic template',
 }
 
@@ -1484,6 +1881,9 @@ def detect_broker(content: str) -> str | None:
     """Sniff the CSV format. Returns a BROKER_PARSERS key or None if unrecognised."""
     head = content.lstrip('﻿')[:4000]
     first_lines = [ln.strip() for ln in head.splitlines()[:5] if ln.strip()]
+    # MT5 deal export: its header row names deal_ticket and position_id.
+    if first_lines and 'deal_ticket' in first_lines[0].lower() and 'position_id' in first_lines[0].lower():
+        return 'mt5'
     if any(ln.startswith(('Statement,Header', 'Trades,Header', 'Account Information,Header'))
            for ln in first_lines):
         return 'ibkr'
@@ -1514,9 +1914,10 @@ def parse_broker_csv(content: str, broker: str, account_id: int, conn=None) -> t
         if not detected:
             raise ValueError(
                 "Could not recognise this CSV. Pick the broker from the dropdown, "
-                "export an account statement from Thinkorswim or an Activity "
-                "Statement from Interactive Brokers, or copy your fills into the "
-                "generic template (Import page, 'Broker not listed?')."
+                "export an account statement from Thinkorswim, an Activity "
+                "Statement from Interactive Brokers, or a deal export from "
+                "MetaTrader 5 (scripts/mt5/ExportDealsCSV.mq5), or copy your fills "
+                "into the generic template (Import page, 'Broker not listed?')."
             )
         key = detected
 

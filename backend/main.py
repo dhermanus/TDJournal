@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 import httpx
 
 from database import init_db, get_db, row_to_dict
-from csv_parser import parse_broker_csv, FUTURES_MULTIPLIERS
+from csv_parser import parse_broker_csv, FUTURES_MULTIPLIERS, MT5_INSTRUMENT_TYPES
 from ai_analysis import (
     analyze_diary_entry,
     analyze_diary_text,
@@ -178,11 +178,20 @@ def put_goals(
 
 # ── Accounts ───────────────────────────────────────────────────────────────────
 
+def _clean_currency(value: str) -> str:
+    """ISO-style 3-letter code, upper-cased (USD, EUR, JPY...)."""
+    code = (value or '').strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        raise ValueError("currency must be a 3-letter code such as USD")
+    return code
+
+
 class AccountCreate(BaseModel):
     name: str
     type: str
     color: str = "#6366f1"
     broker: str | None = None
+    currency: str = "USD"     # the account's deposit currency; P&L is in this currency
 
 
 @app.get("/api/accounts")
@@ -196,6 +205,7 @@ class AccountUpdate(BaseModel):
     type: str | None = None
     color: str | None = None
     broker: str | None = None
+    currency: str | None = None
 
 
 @app.put("/api/accounts/{account_id}")
@@ -212,6 +222,12 @@ def update_account(account_id: int, data: AccountUpdate, conn: sqlite3.Connectio
         valid_types = {'day_trading', 'swing_trading', 'investment'}
         if updates['type'] not in valid_types:
             raise ValueError(f"type must be one of {valid_types}")
+    if 'currency' in updates:
+        updates['currency'] = _clean_currency(updates['currency'])
+        stored = conn.execute("SELECT COUNT(*) FROM trades WHERE account_id=?", (account_id,)).fetchone()[0]
+        if stored and updates['currency'] != (row['currency'] or 'USD'):
+            raise ValueError("The currency of an account that already has trades cannot be changed; "
+                             "create a separate account instead.")
 
     set_clause = ', '.join(f"{k}=?" for k in updates)
     conn.execute(f"UPDATE accounts SET {set_clause} WHERE id=?", list(updates.values()) + [account_id])
@@ -228,8 +244,8 @@ def create_account(data: AccountCreate, conn: sqlite3.Connection = Depends(get_c
         raise ValueError(f"type must be one of {valid_types}")
 
     cursor = conn.execute(
-        "INSERT INTO accounts (name, type, color, broker) VALUES (?,?,?,?)",
-        (data.name, data.type, data.color, data.broker)
+        "INSERT INTO accounts (name, type, color, broker, currency) VALUES (?,?,?,?,?)",
+        (data.name, data.type, data.color, data.broker, _clean_currency(data.currency))
     )
     conn.commit()
 
@@ -408,11 +424,23 @@ def _replace_regrouped_trades(conn, account_id: int, trades: list[dict]) -> None
             conn.execute("UPDATE trade_tags SET trade_group=? WHERE trade_group=?", (target, g))
 
 
+def _decode_upload(raw: bytes) -> str:
+    """Bytes of an uploaded CSV -> text. MetaTrader's default text output can be UTF-16."""
+    if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return raw.decode('utf-16')
+    if b'\x00' in raw[:200]:  # UTF-16 without a BOM
+        return raw.decode('utf-16-le')
+    try:
+        return raw.decode('utf-8-sig')  # strips BOM
+    except UnicodeDecodeError:
+        return raw.decode('latin-1')
+
+
 @app.post("/api/import-csv")
 async def import_csv(
     account_id: int = Form(...),
     file: UploadFile = File(...),
-    broker: str = Form('auto'),   # 'thinkorswim' | 'ibkr' | 'auto' (sniff the file)
+    broker: str = Form('auto'),   # 'thinkorswim' | 'ibkr' | 'mt5' | 'generic' | 'auto' (sniff the file)
     conn: sqlite3.Connection = Depends(get_connection),
 ):
     if not file.filename.lower().endswith('.csv'):
@@ -423,10 +451,7 @@ async def import_csv(
         raise ValueError(f"Account {account_id} not found")
 
     raw = await file.read()
-    try:
-        content = raw.decode('utf-8-sig')  # strips BOM
-    except UnicodeDecodeError:
-        content = raw.decode('latin-1')
+    content = _decode_upload(raw)
 
     trades, skipped = parse_broker_csv(content, broker, account_id, conn)
 
@@ -441,15 +466,19 @@ async def import_csv(
                     INSERT INTO trades
                         (account_id, trade_group, date, ticker, instrument_type, side,
                          gross_pnl, net_pnl, commissions, executions,
-                         option_expiry, option_strike, option_type, source)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         option_expiry, option_strike, option_type, source,
+                         swap, position_id, pips)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(trade_group, account_id) DO UPDATE SET
                         date=excluded.date,
                         side=excluded.side,
+                        instrument_type=excluded.instrument_type,
                         gross_pnl=excluded.gross_pnl,
                         net_pnl=excluded.net_pnl,
                         commissions=excluded.commissions,
                         executions=excluded.executions,
+                        swap=excluded.swap,
+                        pips=excluded.pips,
                         imported_at=datetime('now')
                 """, (
                     trade['account_id'], trade['trade_group'], trade['date'],
@@ -457,6 +486,7 @@ async def import_csv(
                     trade['gross_pnl'], trade['net_pnl'], trade['commissions'],
                     trade['executions'], trade['option_expiry'],
                     trade['option_strike'], trade['option_type'], trade['source'],
+                    trade.get('swap', 0), trade.get('position_id'), trade.get('pips'),
                 ))
                 imported += 1
             except Exception as e:
@@ -582,6 +612,12 @@ def create_trade(data: TradeCreate, conn: sqlite3.Connection = Depends(get_conne
     if not account:
         raise ValueError(f"Account {data.account_id} not found")
 
+    if data.instrument_type.upper() in MT5_INSTRUMENT_TYPES:
+        raise ValueError(
+            "FX and other MetaTrader 5 trades are imported from the MT5 export script, "
+            "not entered by hand: lot size, swap and pip values would not be calculated correctly."
+        )
+
     gross_pnl, net_pnl = compute_manual_pnl(
         data.side, data.entry_price, data.exit_price, data.quantity, data.commissions
     )
@@ -665,6 +701,11 @@ def update_trade(trade_id: int, data: dict, conn: sqlite3.Connection = Depends(g
 
 def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
     """Recalculate P&L from executions and persist. Returns updated trade row dict."""
+    if trade['instrument_type'] in MT5_INSTRUMENT_TYPES:
+        # This recalculation is price x quantity x multiplier, which is wrong for lots and
+        # ignores swap. MT5 trades take their P&L from the broker, so change them by re-importing.
+        raise ValueError("MT5 trades cannot be edited execution by execution; re-import the "
+                         "export to update them.")
     side = trade['side']
     instrument = trade['instrument_type']
     ticker = trade['ticker']
