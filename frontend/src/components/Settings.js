@@ -1,13 +1,19 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Plus, Pencil, GitMerge, Trash2, Search } from 'lucide-react';
-import { libraryApi } from '../api';
+import { libraryApi, mt5TimezoneApi } from '../api';
 import { PageHeader } from './ui';
 
 const SECTIONS = [
   { id: 'strategy', label: 'Strategies' },
   { id: 'source', label: 'Sources' },
   { id: 'tag', label: 'Tags' },
+  { id: 'import', label: 'Import' },
 ];
+
+// Sections that read their count from the loaded library list. Anything else
+// (Import, Backup) has no count; falling through to `lib.sources` for an
+// unknown id would print a meaningless number on a tab that has no list.
+const COUNTED_SECTIONS = new Set(['strategy', 'source', 'tag']);
 
 const TAG_TYPE_LABEL = {
   mistake: 'Mistakes', execution: 'Execution', setup: 'Setup', emotion: 'Emotion', outcome: 'Outcome',
@@ -270,6 +276,137 @@ function ItemList({ kind, tagType = '', title, sub, noun, items, onChanged }) {
   );
 }
 
+/** The endpoint always sends these keys; normalising keeps every read below
+ *  safe when a test or a proxy answers with an empty object. */
+const normaliseMt5 = (data) => ({
+  timezone: '',
+  effective: '',
+  source: 'unset',
+  valid: false,
+  error: null,
+  current_offset_hours: null,
+  candidates: [],
+  transitions: [],
+  ...(data || {}),
+});
+
+/** MT5 imports read broker-server wall time with no offset attached, so the
+ *  zone has to be named here before a deal file means anything. */
+function ImportSettings() {
+  const [state, setState] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await mt5TimezoneApi.get();
+      setState(normaliseMt5(res.data));
+      setDraft(res.data?.timezone || res.data?.effective || '');
+      setError(null);
+    } catch (e) {
+      setError(errText(e));
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const res = await mt5TimezoneApi.put(draft.trim());
+      setState(normaliseMt5(res.data));
+      setNotice(`Saved ${res.data?.effective || draft.trim()}. Imports will convert with this zone.`);
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!state && !error) return <div className="skeleton" style={{ height: 220 }} />;
+
+  const candidates = state.candidates || [];
+  const transitions = state.transitions || [];
+
+  return (
+    <section className="card" aria-label="MT5 import settings">
+      <div className="settings-head">
+        <div style={{ minWidth: 0 }}>
+          <h2 className="section-title">MT5 timestamps</h2>
+          <div className="section-sub">
+            MT5 exports the broker server's own clock with no timezone attached.
+            Name the zone the server runs on and every deal and bar is converted
+            to UTC before it is stored, using the daylight-saving rule that was
+            in force on that date.
+          </div>
+        </div>
+      </div>
+
+      {notice && <div className="notice pos settings-notice" role="status">{notice}</div>}
+
+      <div className="settings-form">
+        <label>
+          <span className="field-label">Broker server timezone</span>
+          <select value={draft} onChange={e => { setDraft(e.target.value); setNotice(null); }}>
+            <option value="">Choose a timezone…</option>
+            {draft && !candidates.includes(draft) && <option value={draft}>{draft}</option>}
+            {candidates.map(z => <option key={z} value={z}>{z}</option>)}
+          </select>
+        </label>
+        <div className="settings-form-actions">
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={busy || !draft.trim() || draft.trim() === state.effective}
+            onClick={save}
+          >
+            Save timezone
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="notice neg" role="alert" style={{ marginTop: 10 }}>{error}</div>}
+
+      <div className="section-sub" style={{ marginTop: 12 }}>
+        {state.valid ? (
+          <>
+            {state.source === 'setting' ? 'Saved setting.' : 'Not saved yet — using the environment value.'}
+            {' '}Current offset on this zone: {state.current_offset_hours > 0 ? '+' : ''}
+            {state.current_offset_hours} h.
+            {' '}That is today's offset; imports use each date's own offset.
+          </>
+        ) : (
+          <span role="alert">No usable timezone yet. Imports will refuse to convert timestamps until this is set.</span>
+        )}
+      </div>
+
+      {transitions.length > 0 && (
+        <table className="table" style={{ marginTop: 14 }}>
+          <caption className="text-muted" style={{ captionSide: 'top', textAlign: 'left', fontSize: 13, paddingBottom: 8 }}>
+            Clock changes on this zone — check they match what your broker says.
+          </caption>
+          <thead>
+            <tr><th scope="col">At (UTC)</th><th scope="col">Offset before</th><th scope="col">Offset after</th></tr>
+          </thead>
+          <tbody>
+              {transitions.map(t => (
+              <tr key={t.at_utc}>
+                <td className="num">{t.at_utc}</td>
+                <td className="num">+{t.offset_hours_before} h</td>
+                <td className="num">+{t.offset_hours_after} h</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+/** Backup, restore, and export. All local: an archive written to a folder on
+ *  this machine, never to a network destination. */
 export default function Settings() {
   const [lib, setLib] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -315,7 +452,7 @@ export default function Settings() {
             onKeyDown={onTabKey}
           >
             {s.label}
-            {lib && (
+            {lib && COUNTED_SECTIONS.has(s.id) && (
               <span className="text-muted num" style={{ marginLeft: 6, fontWeight: 500 }}>
                 {s.id === 'tag'
                   ? TAG_TYPE_ORDER.reduce((n, t) => n + (lib.tags?.[t]?.length || 0), 0)
@@ -327,8 +464,10 @@ export default function Settings() {
       </div>
 
       <div role="tabpanel" id="settings-panel" aria-labelledby={`settings-tab-${section}`}>
-        {loadError && <div className="notice neg" role="alert">{loadError}</div>}
-        {!lib && !loadError && <div className="skeleton" style={{ height: 320 }} />}
+        {/* Import and Backup do not read the library, so a library load failure
+            (or its loading skeleton) must not cover them up. */}
+        {loadError && !COUNTED_SECTIONS.has(section) && <div className="notice neg" role="alert">{loadError}</div>}
+        {!lib && !loadError && COUNTED_SECTIONS.has(section) && <div className="skeleton" style={{ height: 320 }} />}
 
         {lib && section === 'strategy' && (
           <ItemList kind="strategy" {...SECTION_COPY.strategy} items={lib.strategies} onChanged={load} />
@@ -351,6 +490,7 @@ export default function Settings() {
             ))}
           </div>
         )}
+        {section === 'import' && <ImportSettings />}
       </div>
     </div>
   );

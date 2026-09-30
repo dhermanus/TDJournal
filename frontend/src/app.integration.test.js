@@ -2,7 +2,7 @@
 // Settings library behaves. The api module is mocked, so no test reaches a backend.
 import { render, screen, within, fireEvent, waitFor, act } from '@testing-library/react';
 import App from './App';
-import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, __restoreMocks } from './api';
+import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, mt5TimezoneApi, chartApi, __restoreMocks } from './api';
 
 jest.mock('./api', () => {
   const ok = (data) => Promise.resolve({ data });
@@ -34,6 +34,13 @@ jest.mock('./api', () => {
     { id: 1, name: 'Day Trading', type: 'day_trading', color: '#6366f1', broker: 'Schwab' },
     { id: 2, name: 'Swing', type: 'swing', color: '#6366f1', broker: 'Schwab' },
   ];
+  const MT5_TIMEZONE = {
+    timezone: '', effective: 'Europe/Athens', source: 'env', valid: true, error: null,
+    current_offset_hours: 3, candidates: ['Europe/Athens', 'Europe/London'],
+    transitions: [
+      { at_utc: '2026-03-29 01:00:00', offset_hours_before: 2, offset_hours_after: 3 },
+    ],
+  };
   const LIBRARY = {
     strategies: [
       { name: 'VWAP Cross', description: 'Reclaim of VWAP', trades: 10, aliases: [], },
@@ -89,6 +96,10 @@ jest.mock('./api', () => {
       remove: fn(() => ok({ affected: 1, reassigned_to: null })),
       update: fn(() => ok({ name: 'VWAP Cross', trades: 10 })),
       create: fn(() => ok({ name: 'New' })),
+    }),
+    mt5TimezoneApi: withDefault({
+      get: fn(() => ok(MT5_TIMEZONE)),
+      put: fn(() => ok({ ...MT5_TIMEZONE, timezone: 'Europe/London', effective: 'Europe/London', source: 'setting', valid: true })),
     }),
   };
 });
@@ -198,6 +209,23 @@ test('Trade View opens Trade Details with all five tabs, back and previous/next'
   expect(screen.getByRole('button', { name: 'Delete execution 1' })).toBeInTheDocument();
 });
 
+test('The chart names the axis of whichever feed answered', async () => {
+  // Same chart, two feeds: imported bars are UTC, the remote equity feed is
+  // ET. Leaving the label off let the same panel read either way silently.
+  chartApi.get.mockImplementation(() => Promise.resolve({ data: { source: 'local', bars: [], warning: null } }));
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
+  const row = (await screen.findAllByText('TSLA'))[0].closest('tr');
+  fireEvent.click(row);
+  expect(await screen.findByText('UTC axis')).toBeInTheDocument();
+
+  chartApi.get.mockImplementation(() => Promise.resolve({ data: { bars: [], warning: 'No chart data in tests' } }));
+  fireEvent.click(screen.getByRole('button', { name: /Back to trades/ }));
+  const other = (await screen.findAllByText('TSLA'))[0].closest('tr');
+  fireEvent.click(other);
+  expect(await screen.findByText('ET axis')).toBeInTheDocument();
+});
+
 test('Import keeps broker CSV import and diary analysis, with keyboard dropzones', async () => {
   await renderApp();
   fireEvent.click(within(screen.getByRole('banner')).getByRole('button', { name: /^Import$/ }));
@@ -208,9 +236,37 @@ test('Import keeps broker CSV import and diary analysis, with keyboard dropzones
   expect(broker).toHaveValue('auto');
   expect(within(broker).getByRole('option', { name: /Interactive Brokers/ })).toBeInTheDocument();
   expect(within(broker).getByRole('option', { name: /Thinkorswim/ })).toBeInTheDocument();
+  expect(within(broker).getByRole('option', { name: /MetaTrader 5/ })).toBeInTheDocument();
+  // Broker CSV, M1 bars and diary — each with a keyboard-reachable dropzone.
   const dropzones = screen.getAllByRole('button', { name: /Press Enter to browse/ });
-  expect(dropzones).toHaveLength(2);
+  expect(dropzones).toHaveLength(3);
   dropzones.forEach(z => expect(z).toHaveAttribute('tabindex', '0'));
+});
+
+test('Import offers a bar dropzone alongside the deal and diary ones', async () => {
+  await renderApp();
+  fireEvent.click(within(screen.getByRole('banner')).getByRole('button', { name: /^Import$/ }));
+  expect(await screen.findByRole('heading', { name: /Import M1 Bars/ })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Drop an M1 bar CSV/ })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Import Bars/ })).toBeInTheDocument();
+  expect(screen.getByText(/ExportBarsCSV/)).toBeInTheDocument();
+});
+
+test('Choosing MetaTrader 5 warns that the server timezone must be set first', async () => {
+  await renderApp();
+  fireEvent.click(within(screen.getByRole('banner')).getByRole('button', { name: /^Import$/ }));
+  expect(await screen.findByRole('heading', { name: /Import Broker CSV/ })).toBeInTheDocument();
+
+  const broker = screen.getByLabelText('Broker');
+  // Daylight saving is only correct if the zone is chosen before the first
+  // import — later changes would shift dates under already-grouped trades.
+  fireEvent.change(broker, { target: { value: 'mt5' } });
+  expect(broker).toHaveValue('mt5');
+  // Scoped to the broker help: the bars card beside it mentions a server
+  // timezone too, so an unscoped match would hit either of two cards.
+  const help = screen.getByRole('heading', { name: /Import Broker CSV/ }).closest('section');
+  expect(within(help).getByText(/server timezone/i)).toBeInTheDocument();
+  expect(within(help).getByText(/before the first import/i)).toBeInTheDocument();
 });
 
 test('Help lists the metric reference and the feature guide', async () => {
@@ -247,12 +303,12 @@ test('Day Review keeps the loss-streak alert and its Dismiss control', async () 
   expect(screen.getByRole('button', { name: /Regenerate AI/ })).toBeInTheDocument();
 });
 
-test('Settings has Strategies, Sources and Tags sections, and Tags leaves out strategy and source types', async () => {
+test('Settings has Strategies, Sources, Tags, Import sections, and Tags leaves out strategy and source types', async () => {
   await renderApp();
   fireEvent.click(within(nav()).getByRole('button', { name: 'Settings' }));
   const tablist = await screen.findByRole('tablist', { name: 'Settings sections' });
   expect(within(tablist).getAllByRole('tab').map(t => t.textContent.replace(/\d+/g, '').trim()))
-    .toEqual(['Strategies', 'Sources', 'Tags']);
+    .toEqual(['Strategies', 'Sources', 'Tags', 'Import']);
   expect(await screen.findByText('VWAP Cross')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Edit VWAP Cross' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Delete VWAP Cross' })).toBeInTheDocument();
@@ -274,6 +330,26 @@ test('Settings merges one strategy into another', async () => {
     kind: 'strategy', tag_type: '', source_name: 'Continuation RS', target_name: 'VWAP Cross',
   }));
   expect(await screen.findByRole('status')).toHaveTextContent(/2 trades moved/);
+});
+
+test('Settings Import names the MT5 server timezone and saves it', async () => {
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Settings' }));
+  const tablist = await screen.findByRole('tablist', { name: 'Settings sections' });
+  fireEvent.click(within(tablist).getByRole('tab', { name: /Import/ }));
+
+  expect(await screen.findByRole('region', { name: 'MT5 import settings' })).toBeInTheDocument();
+  await waitFor(() => expect(mt5TimezoneApi.get).toHaveBeenCalled());
+  // The env value is active but not saved yet, and the zone's clock changes are shown.
+  expect(screen.getByText(/using the environment value/)).toBeInTheDocument();
+  expect(screen.getByRole('columnheader', { name: 'Offset after' })).toBeInTheDocument();
+
+  fireEvent.change(screen.getByRole('combobox', { name: 'Broker server timezone' }), {
+    target: { value: 'Europe/London' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Save timezone' }));
+  await waitFor(() => expect(mt5TimezoneApi.put).toHaveBeenCalledWith('Europe/London'));
+  expect(await screen.findByRole('status')).toHaveTextContent(/Saved Europe\/London/);
 });
 
 test('Settings delete asks to reassign and can leave trades blank', async () => {

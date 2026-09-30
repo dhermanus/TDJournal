@@ -4,6 +4,9 @@ import csv
 import io
 from datetime import datetime
 
+import instruments
+import mt5_time
+
 
 MONTH_MAP = {
     'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4,
@@ -1307,16 +1310,16 @@ def _generic_side(value):
 
 
 def _generic_asset(value, symbol):
+    """Map an asset_type cell onto a canonical type, or None if unusable.
+
+    Accepts every type in instruments.INSTRUMENT_TYPES plus common spellings,
+    so a generic export carrying FX or METAL rows imports instead of failing
+    validation with 'not STOCK, OPTION or FUTURE'.
+    """
     v = value.strip().upper()
     if not v:
         return 'FUTURE' if symbol.startswith('/') else 'STOCK'
-    if v in ('STOCK', 'STK', 'EQUITY', 'ETF', 'SHARE', 'SHARES'):
-        return 'STOCK'
-    if v in ('OPTION', 'OPT', 'OPTIONS'):
-        return 'OPTION'
-    if v in ('FUTURE', 'FUT', 'FUTURES'):
-        return 'FUTURE'
-    return None
+    return instruments.normalize(v)
 
 
 def _futures_multiplier(ticker):
@@ -1394,7 +1397,10 @@ def parse_generic_rows(content):
         if commission is None:
             why.append(f"commission '{cell(cells, 'commission')}' is not a number")
         if not asset:
-            why.append(f"asset_type '{cell(cells, 'asset_type')}' is not STOCK, OPTION or FUTURE")
+            why.append(
+                f"asset_type '{cell(cells, 'asset_type')}' is not one of "
+                + ", ".join(instruments.INSTRUMENT_TYPES)
+            )
 
         option_expiry = option_strike = option_type = None
         multiplier = 1
@@ -1413,6 +1419,10 @@ def parse_generic_rows(content):
         elif asset == 'FUTURE':
             ticker = symbol if symbol.startswith('/') else '/' + symbol
             multiplier = _futures_multiplier(ticker)
+        else:
+            # FX/METAL/INDEX/STOCK: known value per unit of quantity. None would
+            # mean the type has no defined unit, which these all do.
+            multiplier = instruments.units_per_lot(asset, ticker, FUTURES_MULTIPLIERS)
 
         override = cell(cells, 'multiplier')
         if override:
@@ -1465,18 +1475,527 @@ def parse_generic_csv(content, account_id, conn=None):
     return build_trades_from_executions(parse_generic_rows(content), account_id, conn)
 
 
+# ── MetaTrader 5 deal history ─────────────────────────────────────────────────
+#
+# One row per broker deal, keyed by `deal_ticket` and grouped by `position_id`.
+# Unlike the stock pipeline this does NOT route through
+# build_trades_from_executions: the generic execution fingerprint is
+# date|time|symbol|side|qty|price, and MT5 legitimately emits that exact
+# combination twice within one second: 149 keys collide, covering 201 extra
+# rows in a 2,703-deal export. Deduping against existing executions by that
+# key would silently skip a genuinely new ticket on a later import. This path
+# dedupes by deal_ticket instead.
+#
+# MT5's `profit` is the broker's realised figure for that deal and is
+# authoritative: for FX it has already been converted to account currency at
+# the closing rate, so price × volume × contract_size does not reproduce it.
+# It deliberately excludes commission and swap, which arrive as their own
+# columns — so they are summed into `commissions` (positive, like every other
+# broker here) and subtracted once.
+
+MT5_REQUIRED_COLUMNS = ("deal_ticket", "position_id", "symbol",
+                        "type", "entry", "volume", "price")
+# Two exporter generations are in circulation: the bundled script writes `time`,
+# the post-clock-probe revision renames it `time_server` and appends a flat
+# `time_utc`. Either is accepted; the extra UTC column is never trusted.
+MT5_TIME_COLUMNS = ("time_server", "time")
+MT5_DEAL_KINDS = ("in", "out", "out_by", "inout")
+MT5_OPEN_KINDS = ("in",)
+MT5_EXIT_KINDS = ("out", "out_by")
+
+
+def mt5_header_index(cells) -> dict | None:
+    """Column name -> index for a MetaTrader deal export, or None if not one."""
+    idx = {}
+    for i, raw in enumerate(cells):
+        idx.setdefault(raw.strip().lower().lstrip("﻿"), i)
+    if "deal_ticket" in idx and "position_id" in idx and any(
+        name in idx for name in MT5_TIME_COLUMNS
+    ):
+        return idx
+    return None
+
+
+def _mt5_time_column(col) -> str:
+    """Which time column this file carries — both hold broker-server local time."""
+    return next(name for name in MT5_TIME_COLUMNS if name in col)
+
+
+def _mt5_num(value, column: str, row_no: int) -> float:
+    text = (value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        raise ValueError(
+            f"MT5 row {row_no}: {column} '{text}' is not a number"
+        )
+
+
+def _mt5_iso_utc(server_text: str, tz_name: str):
+    """Server-local stamp -> (YYYY-MM-DD, HH:MM:SS, dst flag or None).
+
+    The exporter's own `time_utc` column is ignored: it subtracts a flat three
+    hours, which is right in summer and an hour wrong for the whole winter
+    half-year. Converting here through zoneinfo applies the rule that was in
+    force on that date.
+    """
+    converted = mt5_time.server_to_utc(server_text, tz_name)
+    if converted.nonexistent:
+        flag = "nonexistent"
+    elif converted.ambiguous:
+        flag = "ambiguous"
+    else:
+        flag = None
+    return converted.iso_date, converted.time, flag
+
+
+def parse_mt5_rows(content: str, tz_name: str) -> tuple[list[dict], dict]:
+    """Read MT5 deals into per-position records. Returns (positions, report).
+
+    Positions arrive in first-seen order; their deals stay in file order,
+    which the exporter already writes chronologically.
+    """
+    reader = csv.reader(io.StringIO(content))
+    header = None
+    col = None
+    time_col = None
+    positions: dict[str, dict] = {}
+    report = {
+        "deals": 0, "balance_rows": 0,
+        "dst_ambiguous": 0, "dst_nonexistent": 0, "bad_rows": 0,
+        "time_column": None, "tz": tz_name,
+    }
+    problems = []
+
+    for row_no, row in enumerate(reader, start=1):
+        if not any(cell.strip() for cell in row):
+            continue
+        if header is None:
+            col = mt5_header_index(row)
+            if col is None:
+                raise ValueError(
+                    "This does not look like a MetaTrader 5 deal export: it has no "
+                    "deal_ticket, position_id and time columns. "
+                    "Export the deal history with ExportDealsCSV.mq5 instead."
+                )
+            header = row
+            missing = [c for c in MT5_REQUIRED_COLUMNS if c not in col]
+            if missing:
+                raise ValueError(
+                    "This MT5 deal export is missing column(s): " + ", ".join(missing)
+                )
+            report["time_column"] = _mt5_time_column(col)
+            time_col = report["time_column"]
+            continue
+
+        def cell(name):
+            i = col.get(name)
+            return row[i].strip() if i is not None and i < len(row) else ""
+
+        try:
+            ticket = cell("deal_ticket")
+            kind = cell("type").lower()
+            entry = cell("entry").lower()
+            if not ticket:
+                raise ValueError(f"row {row_no} has no deal_ticket")
+            if kind in ("balance", "credit", "charge", "correction"):
+                report["balance_rows"] += 1
+                continue
+            if kind not in ("buy", "sell"):
+                raise ValueError(f"row {row_no} has type '{kind}', expected buy, sell or balance")
+            if entry not in MT5_DEAL_KINDS:
+                raise ValueError(f"row {row_no} has entry '{entry}', expected in, out or out_by")
+            if entry == "inout":
+                raise ValueError(
+                    f"row {row_no} (deal {ticket}) is an MT5 netting reversal (inout). "
+                    "This importer requires separate position ids for each side; "
+                    "no trades were imported. Use an MT5 hedging account or split the reversal."
+                )
+
+            iso_date, time_utc, dst_flag = _mt5_iso_utc(cell(time_col), tz_name)
+            if dst_flag == "ambiguous":
+                report["dst_ambiguous"] += 1
+            elif dst_flag == "nonexistent":
+                report["dst_nonexistent"] += 1
+
+            position_id = cell("position_id")
+            if not position_id:
+                raise ValueError(f"row {row_no} has no position_id")
+            symbol = cell("symbol")
+            if not symbol:
+                raise ValueError(f"row {row_no} has no symbol")
+            volume = _mt5_num(cell("volume"), "volume", row_no)
+
+            rec = {
+                "deal_ticket": ticket,
+                "position_id": position_id,
+                "symbol": symbol,
+                "type": kind,
+                "entry": entry,
+                "volume": volume,
+                "price": _mt5_num(cell("price"), "price", row_no),
+                # Commission/swap arrive signed: a debit is negative, a credit
+                # (rollover taken in your favour) is positive. The net of the two
+                # is what the broker actually charged, so negate it to store the
+                # cost positive — the convention every other broker uses here,
+                # keeping net = gross - commissions. Taking abs() per column
+                # would count a credited swap as a cost twice.
+                "commission": -(_mt5_num(cell("commission"), "commission", row_no)
+                                + _mt5_num(cell("swap"), "swap", row_no)),
+                "profit": _mt5_num(cell("profit"), "profit", row_no),
+                "comment": cell("comment"),
+                "date": iso_date,
+                "iso_date": iso_date,
+                "time": time_utc,
+                "server_time": cell(time_col),
+                "symbol_path": cell("symbol_path"),
+            }
+            if dst_flag:
+                rec["time_dst_flag"] = dst_flag
+            report["deals"] += 1
+            positions.setdefault(position_id, {"position_id": position_id, "deals": []})
+            positions[position_id]["deals"].append(rec)
+        except ValueError as exc:
+            problems.append(str(exc))
+            report["bad_rows"] += 1
+
+    if header is None:
+        raise ValueError("The file is empty.")
+    if problems:
+        more = f" (and {len(problems) - 8} more)" if len(problems) > 8 else ""
+        raise ValueError(
+            f"{len(problems)} row(s) could not be read, so nothing was imported{more}. "
+            + " | ".join(problems[:8])
+        )
+    # A position id is only meaningful within one symbol. If a broker ever
+    # reuses ids across symbols (or a file merges two accounts), the deals
+    # would otherwise be grouped into one trade and priced off the first row.
+    for pos in positions.values():
+        symbols = {d["symbol"] for d in pos["deals"]}
+        if len(symbols) > 1:
+            raise ValueError(
+                f"position {pos['position_id']} appears under more than one symbol "
+                f"({', '.join(sorted(symbols))}); no trades were imported. "
+                "This file may combine accounts — export each account separately."
+            )
+    return list(positions.values()), report
+
+
+def _mt5_existing_tickets(conn, account_id) -> set[str]:
+    """Deal tickets already recorded for this account, from stored executions."""
+    if conn is None:
+        return set()
+    tickets = set()
+    for row in conn.execute(
+        "SELECT executions FROM trades WHERE account_id = ? AND source = 'mt5'",
+        (account_id,),
+    ):
+        try:
+            for ex in json.loads(row[0] or "[]"):
+                t = ex.get("deal_ticket")
+                if t is not None:
+                    tickets.add(str(t))
+        except (ValueError, TypeError):
+            continue
+    return tickets
+
+
+def _mt5_position_key(symbol: str, instr: str, position_id: str) -> str:
+    """Stable key: one row per broker position, even after its close date changes.
+
+    The UTC close date is stored in the trade's `date` column, not the key. An
+    open position may be imported today and close in a later export; keeping its
+    group key stable makes that later import update the existing row rather than
+    leave a stale open duplicate behind. The symbol/type scopes the broker's
+    position id while the id avoids same-day sequence collisions.
+    """
+    return f"MT5_{symbol}_{instr}_{position_id}"
+
+
+def mt5_trade_from_position(pos: dict, account_id: int) -> dict | None:
+    """Build one trade dict from a single MT5 position. None for a balance row."""
+    deals = [d for d in pos["deals"]
+             if d["type"] in ("buy", "sell") and d["entry"] in MT5_DEAL_KINDS]
+    if not deals:
+        return None
+
+    # Filings may arrive out of order in a hand-edited file; exits are dated by
+    # the last exit, so order first.
+    deals = sorted(deals, key=lambda d: (d["iso_date"], d["time"], d["deal_ticket"]))
+
+    symbol = deals[0]["symbol"]
+    instr = instruments.classify_mt5(symbol, deals[0].get("symbol_path"))
+    opened = [d for d in deals if d["entry"] in MT5_OPEN_KINDS]
+    exits = [d for d in deals if d["entry"] in MT5_EXIT_KINDS]
+    side = "SHORT" if opened and opened[0]["type"] == "sell" else "LONG"
+
+    # Broker-reported profit wins. A hedge (out_by) leg reports 0 while its
+    # partner carries the realised number, so summing legs gives the position
+    # total without double counting.
+    gross = sum(d["profit"] for d in exits)
+    commissions = round(sum(d["commission"] for d in deals), 2)
+
+    opened_qty = round(sum(d["volume"] for d in opened), 8)
+    closed_qty = round(sum(d["volume"] for d in exits), 8)
+    is_open = not exits or abs(opened_qty - closed_qty) > 1e-8
+
+    if is_open:
+        # An open position has no realised gain to report. Its entries still
+        # cost commission, which the app charges against an open trade.
+        gross, net = 0.0, round(-commissions, 2)
+    else:
+        gross = round(gross, 2)
+        net = round(gross - commissions, 2)
+
+    exit_date = exits[-1]["iso_date"] if exits else opened[-1]["iso_date"]
+
+    execs = [{
+        "date": d["iso_date"],
+        "time": d["time"],
+        "action": "BOT" if d["type"] == "buy" else "SOLD",
+        "qty": d["volume"],
+        "price": d["price"],
+        "commission": round(d["commission"], 2),
+        "reported_profit": d["profit"],
+        "deal_ticket": d["deal_ticket"],
+        "position_id": d["position_id"],
+        "entry": d["entry"],
+        "server_time": d["server_time"],
+        "comment": d["comment"] or None,
+    } for d in deals]
+    for ex, d in zip(execs, deals):
+        if d.get("time_dst_flag"):
+            ex["time_dst_flag"] = d["time_dst_flag"]
+
+    # Keep the broker's own words for the record: an [sl]/[tp] comment is the
+    # difference between a stop that worked and one hit by hand.
+    comment = next((d["comment"] for d in exits if d["comment"].startswith(("[sl", "[tp"))), "")
+
+    return {
+        "account_id": account_id,
+        "trade_group": _mt5_position_key(symbol, instr, pos["position_id"]),
+        "date": exit_date,
+        "ticker": symbol,
+        "instrument_type": instr,
+        "side": side,
+        "gross_pnl": gross,
+        "net_pnl": net,
+        "commissions": commissions,
+        "executions": json.dumps(execs),
+        "option_expiry": None,
+        "option_strike": None,
+        "option_type": None,
+        "source": "mt5",
+        "replaces": [],
+        "is_open": is_open,
+        "position_id": pos["position_id"],
+        "comment": comment,
+    }
+
+
+def parse_mt5_csv(content, account_id, conn=None, tz_name=None):
+    """MT5 deal-history import. Same (trades, skipped) contract as its peers.
+
+    `tz_name` is the broker server's IANA zone; without it the server
+    timestamps have no timezone to be read in, and guessing an offset would
+    silently move trades by an hour for half the year.
+    """
+    if not tz_name:
+        raise ValueError(
+            "No MT5 server timezone is set, so the deal times cannot be converted. "
+            "Set it in Settings → Import (for IC Markets, Europe/Athens) and import again."
+        )
+    mt5_time.load_zone(tz_name)   # raises TimezoneError on an unknown zone
+
+    positions, report = parse_mt5_rows(content, tz_name)
+    known = _mt5_existing_tickets(conn, account_id)
+
+    trades, skipped_deals = [], 0
+    for pos in positions:
+        if known:
+            tickets = {str(d["deal_ticket"]) for d in pos["deals"]}
+            if not (tickets - known):
+                # Every deal of this position is already stored: a repeat of the
+                # same export. The whole position is skipped, counted as deals
+                # rather than trades so the number matches the file.
+                skipped_deals += len(pos["deals"])
+                continue
+            # Partially known: a position imported while still open has since
+            # gained an exit. It is rebuilt from ALL its deals — the upsert
+            # replaces the stored executions wholesale, so a stored entry has to
+            # be present in the replacement or it would be lost.
+        trade = mt5_trade_from_position(pos, account_id)
+        if trade is None:
+            continue
+        trades.append(trade)
+
+    report["skipped_deals"] = skipped_deals
+    report["positions"] = len(trades)
+    report["open_positions"] = sum(1 for t in trades if t["is_open"])
+    return trades, report
+
+
+# ── M1 bars ───────────────────────────────────────────────────────────────────
+# ExportBarsCSV.mq5 writes one file per symbol:
+#   time,open,high,low,close,tick_volume
+# Timestamps are the same raw broker-server clock the deal export uses (verified
+# against 2,678 of 2,703 fills whose price lands inside its own bar), so bars go
+# through the same zone conversion as deals and share one timeline.
+
+BAR_REQUIRED_COLUMNS = ("time", "open", "high", "low", "close")
+
+# TDJournal_bars_EURUSD_M1.csv, or the UUID-prefixed name an upload arrives with.
+_BAR_FILE_RE = re.compile(r"bars[_-](.+?)[_-]m1\.csv$", re.IGNORECASE)
+
+
+def symbol_from_bar_filename(filename: str) -> str | None:
+    """EURUSD out of `TDJournal_bars_EURUSD_M1.csv`, else None.
+
+    The exporter sanitises symbols for the filesystem (a `/` becomes `_`), so
+    this is the file's own spelling of the symbol; a caller that cannot match it
+    to a known instrument should say so rather than store it under a guess.
+    """
+    if not filename:
+        return None
+    m = _BAR_FILE_RE.search(filename.replace("\\", "/").split("/")[-1])
+    return m.group(1) if m else None
+
+
+def parse_mt5_bars_csv(content: str, tz_name: str) -> tuple[list[dict], dict]:
+    """Read an M1 bar export into rows ready for the `bars` table.
+
+    Returns (bars, report). Times become naive UTC exactly as deal timestamps
+    do, so a trade's fills and the candles under them line up without any
+    per-call offset.
+    """
+    if not tz_name:
+        raise ValueError(
+            "No MT5 server timezone is set, so the bar times cannot be converted. "
+            "Set it in Settings → Import (for IC Markets, Europe/Athens) and import again."
+        )
+    mt5_time.load_zone(tz_name)   # raises TimezoneError on an unknown zone
+
+    reader = csv.reader(io.StringIO(content))
+    header = None
+    col = None
+    bars: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    problems: list[str] = []
+    report = {
+        "bars": 0, "duplicates": 0, "first": None, "last": None,
+        "dst_ambiguous": 0, "dst_nonexistent": 0, "tz": tz_name,
+    }
+
+    for row_no, row in enumerate(reader, start=1):
+        if not any(c.strip() for c in row):
+            continue
+        if header is None:
+            col = {c.strip().lower().lstrip("﻿"): i for i, c in enumerate(row)}
+            if "time" not in col:
+                raise ValueError(
+                    "This does not look like an M1 bar export: it has no 'time' column. "
+                    "Export with ExportBarsCSV.mq5 instead."
+                )
+            missing = [c for c in BAR_REQUIRED_COLUMNS if c not in col]
+            if missing:
+                raise ValueError(
+                    "This M1 bar export is missing column(s): " + ", ".join(missing)
+                )
+            header = row
+            continue
+
+        def cell(name):
+            i = col.get(name)
+            return row[i].strip() if i is not None and i < len(row) else ""
+
+        try:
+            raw_time = cell("time")
+            if not raw_time:
+                raise ValueError(f"row {row_no} has no time")
+            values = {}
+            for name in ("open", "high", "low", "close"):
+                text = cell(name)
+                if not text:
+                    raise ValueError(f"row {row_no} has no {name}")
+                try:
+                    values[name] = float(text.replace(",", ""))
+                except ValueError:
+                    raise ValueError(f"row {row_no}: {name} '{text}' is not a number")
+            # tick_volume is display-only; a blank must not fail the import.
+            volume_text = cell("tick_volume") or "0"
+            try:
+                volume_value = float(volume_text)
+                if not volume_value.is_integer() or volume_value < 0:
+                    raise ValueError
+                volume = int(volume_value)
+            except ValueError:
+                raise ValueError(
+                    f"row {row_no}: tick_volume '{volume_text}' must be a non-negative integer"
+                )
+            if values["high"] < max(values["open"], values["close"], values["low"]):
+                raise ValueError(f"row {row_no}: high is below open, low or close")
+            if values["low"] > min(values["open"], values["close"], values["high"]):
+                raise ValueError(f"row {row_no}: low is above open, high or close")
+            parsed_time = mt5_time.parse_server_timestamp(raw_time)
+            if parsed_time.second != 0 or parsed_time.microsecond != 0:
+                raise ValueError(f"row {row_no}: M1 bar time must be on a minute boundary")
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+
+        converted = mt5_time.server_to_utc(raw_time, tz_name)
+        if converted.nonexistent:
+            report["dst_nonexistent"] += 1
+        elif converted.ambiguous:
+            report["dst_ambiguous"] += 1
+
+        key = (converted.iso_date, converted.time)
+        if key in seen:
+            report["duplicates"] += 1
+        else:
+            seen.add(key)
+        bars.append({
+            "time": f"{converted.iso_date} {converted.time}",
+            "iso_date": converted.iso_date,
+            "open": values["open"], "high": values["high"],
+            "low": values["low"], "close": values["close"],
+            "tick_volume": volume,
+            "server_time": raw_time,
+        })
+
+    if header is None:
+        raise ValueError("The file is empty.")
+    if problems:
+        more = f" (and {len(problems) - 8} more)" if len(problems) > 8 else ""
+        raise ValueError(
+            f"{len(problems)} row(s) could not be read, so no bars were imported{more}. "
+            + " | ".join(problems[:8])
+        )
+    if not bars:
+        raise ValueError("This file has a header but no bars, so nothing was imported.")
+
+    report["bars"] = len(bars)
+    report["first"] = bars[0]["time"]
+    report["last"] = bars[-1]["time"]
+    return bars, report
+
+
 # ── Broker dispatch ────────────────────────────────────────────────────────────
 
 BROKER_PARSERS = {
     'thinkorswim': parse_thinkorswim_csv,
     'ibkr': parse_ibkr_csv,
     'generic': parse_generic_csv,
+    'mt5': parse_mt5_csv,
 }
 
 BROKER_LABELS = {
     'thinkorswim': 'Thinkorswim',
     'ibkr': 'Interactive Brokers',
     'generic': 'the generic template',
+    'mt5': 'MetaTrader 5',
 }
 
 
@@ -1493,6 +2012,11 @@ def detect_broker(content: str) -> str | None:
     if ('CASH BALANCE' in upper or 'ACCOUNT STATEMENT' in upper
             or 'ACCOUNT TRADE HISTORY' in upper or 'FUTURES STATEMENTS' in upper):
         return 'thinkorswim'
+    # MT5 is checked before the generic template parser because its CSV starts
+    # with a header row, and a future exporter may share some generic columns.
+    for cells in csv.reader(io.StringIO(head)):
+        if mt5_header_index(cells):
+            return 'mt5'
     # Checked last: the first non-empty row is a header with the template's columns.
     for cells in csv.reader(io.StringIO(head)):
         if not any(c.strip() for c in cells):
@@ -1501,11 +2025,15 @@ def detect_broker(content: str) -> str | None:
     return None
 
 
-def parse_broker_csv(content: str, broker: str, account_id: int, conn=None) -> tuple[list[dict], int]:
+def parse_broker_csv(content: str, broker: str, account_id: int, conn=None,
+                     **kwargs) -> tuple[list[dict], int]:
     """
     Route a CSV to the right broker parser. broker is a BROKER_PARSERS key or
     'auto'. An explicit broker that clearly does not match the file raises a
     ValueError with a hint, instead of importing zero trades silently.
+
+    `kwargs` reaches parsers that need context the others do not — MT5 needs
+    the broker server's timezone to read its timestamps.
     """
     key = (broker or 'auto').strip().lower()
     detected = detect_broker(content)
@@ -1529,4 +2057,7 @@ def parse_broker_csv(content: str, broker: str, account_id: int, conn=None) -> t
             f"{BROKER_LABELS[key]} is selected. Change the broker dropdown and try again."
         )
 
-    return BROKER_PARSERS[key](content, account_id, conn)
+    parser = BROKER_PARSERS[key]
+    if key == 'mt5':
+        return parser(content, account_id, conn, tz_name=kwargs.get('tz_name'))
+    return parser(content, account_id, conn)

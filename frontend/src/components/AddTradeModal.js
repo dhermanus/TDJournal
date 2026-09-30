@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { X } from 'lucide-react';
 import { tradesApi } from '../api';
+import { INSTRUMENT_TYPES, INSTRUMENT_LABELS } from '../instruments';
 import useModalFocus from './useModalFocus';
 
 export default function AddTradeModal({ accounts, defaultAccountId, onClose, onSaved }) {
@@ -102,9 +103,9 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
             <div>
               <label className="field-label" htmlFor="at-type">Instrument Type</label>
               <select id="at-type" style={fieldStyle} value={form.instrument_type} onChange={e => update('instrument_type', e.target.value)}>
-                <option value="STOCK">Stock</option>
-                <option value="OPTION">Option</option>
-                <option value="FUTURE">Future</option>
+                {INSTRUMENT_TYPES.map(t => (
+                  <option key={t} value={t}>{INSTRUMENT_LABELS[t]}</option>
+                ))}
               </select>
             </div>
 

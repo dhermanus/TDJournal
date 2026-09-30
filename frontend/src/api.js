@@ -35,6 +35,9 @@ export const importApi = {
   importCsv: (formData) => api.post('/api/import-csv', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
+  importBars: (formData) => api.post('/api/import-bars', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
   uploadDiary: (formData) => api.post('/api/upload-diary', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
@@ -91,6 +94,10 @@ export const libraryApi = {
   remove: (item) => api.post('/api/library/delete', item),
 };
 
+export const mt5TimezoneApi = {
+  get: () => api.get('/api/mt5/timezone'),
+  put: (timezone) => api.put('/api/mt5/timezone', { timezone }),
+};
 export const edgeReportApi = {
   get: (params) => api.get('/api/edge-report', { params }),
 };

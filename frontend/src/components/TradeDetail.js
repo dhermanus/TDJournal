@@ -3,6 +3,7 @@ import { ArrowLeft, ChevronLeft, ChevronRight, PlusCircle, Trash2, Pencil } from
 import { tradesApi, chartApi } from '../api';
 import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
+import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
 
 const fmt$ = (v) => {
   if (v == null) return '—';
@@ -216,7 +217,6 @@ function getPriceAt(bars, hhmm) {
 function computeWhatIf(bars, stats, trade) {
   if (!bars.length || !stats.isClosed || !stats.avgExit || !stats.closeTime) return null;
   const [exitH, exitM] = stats.closeTime.split(':').map(Number);
-  const isStock  = !trade.instrument_type || trade.instrument_type === 'STOCK';
   const sideSign = trade.side === 'LONG' ? 1 : -1;
 
   return SCENARIOS.map(({ label, offsetMin }) => {
@@ -229,7 +229,10 @@ function computeWhatIf(bars, stats, trade) {
     }
     const price = getPriceAt(bars, scenarioHHMM);
     if (price == null) return { label, scenarioHHMM, price: null, deltaPnl: null, whatIfPnl: null };
-    const deltaPnl  = isStock ? (price - stats.avgExit) * stats.totalQty * sideSign : null;
+    // Withheld unless one price unit is worth one currency unit per quantity:
+    // for FX a 0.00250 move is $250, not $0.0025, so the arithmetic would lie.
+    const deltaPnl  = isPriceDeltaLinear(trade.instrument_type)
+      ? (price - stats.avgExit) * stats.totalQty * sideSign : null;
     const whatIfPnl = deltaPnl != null ? (trade.net_pnl ?? 0) + deltaPnl : null;
     return { label, scenarioHHMM, price, deltaPnl, whatIfPnl };
   });
@@ -525,7 +528,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
         title={trade.ticker}
         subtitle={<>
           <span className="num">{trade.date}</span>
-          {' / '}{trade.instrument_type ? trade.instrument_type.charAt(0) + trade.instrument_type.slice(1).toLowerCase() : 'Stock'}
+          {' / '}{instrumentLabel(trade.instrument_type)}
           {' / '}{trade.side === 'LONG' ? 'Long' : trade.side === 'SHORT' ? 'Short' : trade.side}
           {stats.openTime && <> · Opened <span className="num">{stats.openTime.slice(0, 5)}</span></>}
           {stats.closeTime && stats.isClosed && <> · Closed <span className="num">{stats.closeTime.slice(0, 5)}</span></>}
@@ -1000,26 +1003,26 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 ) : whatIfBars !== null && whatIfBars.length === 0 ? (
                   <div className="text-muted" style={{ fontSize: 14 }}>Chart data unavailable. Alpaca market data is required for this feature.</div>
                 ) : whatIfBars !== null && (() => {
-                  const isStock  = !trade.instrument_type || trade.instrument_type === 'STOCK';
+                  const canEstimate = isPriceDeltaLinear(trade.instrument_type);
                   const scenarios = computeWhatIf(whatIfBars, stats, trade);
                   if (!scenarios) return <div className="text-muted" style={{ fontSize: 14 }}>Insufficient trade data.</div>;
                   return (
                     <div>
-                      {!isStock && (
+                      {needsWhatIfCaveat(trade.instrument_type) && (
                         <div className="notice accent" style={{ fontSize: 13, marginBottom: 10 }}>
-                          Prices shown are the <strong>underlying stock</strong>. Option P&L depends on delta, theta, and time value, so estimated P&L is not computed.
+                          {whatIfCaveat(trade.instrument_type)}
                         </div>
                       )}
                       <div className="text-muted" style={{ marginBottom: 10, fontSize: 13 }}>
                         Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>${stats.avgExit?.toFixed(2)}</strong>
-                        {isStock && <> · Net P&L: <strong className={`num ${(trade.net_pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong></>}
+                        {' '}· Net P&L: <strong className={`num ${(trade.net_pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                       </div>
                       <table>
                         <thead>
                           <tr>
                             <th className={undefined}>Scenario</th>
                             <th className={'num'}>Price</th>
-                            {isStock && <>
+                            {canEstimate && <>
                               <th className={'num'}>Est. P&L</th>
                               <th className={'num'}>vs Actual</th>
                             </>}
@@ -1033,7 +1036,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                               <tr key={i}>
                                 <td style={{ fontWeight: 500 }}>{s.label}</td>
                                 <td className="num">{s.price != null ? `$${s.price.toFixed(2)}` : '—'}</td>
-                                {isStock && <>
+                                {canEstimate && <>
                                   <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>
                                     {s.whatIfPnl != null ? fmtSigned$(s.whatIfPnl) : '—'}
                                   </td>
@@ -1130,7 +1133,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
 
           {/* What-if scenarios */}
           {stats.isClosed && whatIfBars !== null && whatIfBars.length > 0 && (() => {
-            const isStock = !trade.instrument_type || trade.instrument_type === 'STOCK';
+            const canEstimate = isPriceDeltaLinear(trade.instrument_type);
             const scenarios = computeWhatIf(whatIfBars, stats, trade);
             if (!scenarios) return null;
             return (
@@ -1138,11 +1141,11 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 <h2 className="section-title">What If Scenarios</h2>
                 <div className="text-muted" style={{ fontSize: 13, margin: '4px 0 12px' }}>
                   Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>${stats.avgExit?.toFixed(2)}</strong>
-                  {isStock && <> · Net P&L: <strong className={`num ${pnl >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong></>}
+                  {' '}· Net P&L: <strong className={`num ${pnl >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                 </div>
-                {!isStock && (
+                {needsWhatIfCaveat(trade.instrument_type) && (
                   <div className="notice accent" style={{ fontSize: 13, marginBottom: 10 }}>
-                    Prices shown are the underlying stock. Option P&L not estimated.
+                    {whatIfCaveat(trade.instrument_type)}
                   </div>
                 )}
                 <div className="scroll-x" style={{ margin: '0 -24px', padding: '0 12px' }}>
@@ -1151,7 +1154,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                     <tr>
                       <th className={undefined}>Scenario</th>
                       <th className={'num'}>Price</th>
-                      {isStock && <>
+                      {canEstimate && <>
                         <th className={'num'}>Est. P&L</th>
                         <th className={'num'}>vs Actual</th>
                       </>}
@@ -1165,7 +1168,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         <tr key={i}>
                           <td style={{ fontWeight: 500 }}>{s.label}</td>
                           <td className="num">{s.price != null ? `$${s.price.toFixed(2)}` : '—'}</td>
-                          {isStock && <>
+                          {canEstimate && <>
                             <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>
                               {s.whatIfPnl != null ? fmtSigned$(s.whatIfPnl) : '—'}
                             </td>

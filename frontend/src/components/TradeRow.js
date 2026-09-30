@@ -29,7 +29,7 @@ export default function TradeRow({ trade, openTime, onOpenDetail, customSetups =
   // Playbook setup tag: set by hand from the dropdown below.
   const ADD_NEW = '__add_new__';
 
-  /** Setup cell: shows the badge, click to tag. Stock trades only. */
+  /** Setup cell: shows the badge, click to tag. Any instrument type. */
   function SetupEditor({ trade }) {
     const [editing, setEditing] = useState(false);
     const [saving, setSaving] = useState(false);
@@ -37,10 +37,6 @@ export default function TradeRow({ trade, openTime, onOpenDetail, customSetups =
       setup: trade.setup, grade: trade.setup_grade,
       notes: trade.setup_notes, source: trade.setup_source,
     });
-
-    if (trade.instrument_type && trade.instrument_type !== 'STOCK') {
-      return <span className="text-faint" style={{ fontSize: 13 }} title="Setups are tagged on stock trades only">—</span>;
-    }
 
     const save = async (value) => {
       if (value === ADD_NEW) {

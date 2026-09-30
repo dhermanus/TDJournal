@@ -668,7 +668,7 @@ summary:focus-visible {
   background: var(--surface-control);
   color: var(--text-secondary);
 }
-.badge-stock, .badge-option, .badge-future, .badge-long, .badge-short { background: var(--surface-control); color: var(--text-secondary); }
+.badge-stock, .badge-option, .badge-future, .badge-fx, .badge-metal, .badge-index, .badge-long, .badge-short { background: var(--surface-control); color: var(--text-secondary); }
 
 .confidence-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .confidence-high { background: var(--result-pos); }

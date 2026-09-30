@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import { Upload, FileText, Image, CheckCircle, AlertCircle } from 'lucide-react';
+import { Upload, FileText, Image, CheckCircle, AlertCircle, CandlestickChart } from 'lucide-react';
 import { importApi } from '../api';
+import { INSTRUMENT_TYPES } from '../instruments';
 import { PageHeader } from './ui';
 
 // Brokers the backend can parse (keys match csv_parser.BROKER_PARSERS).
@@ -9,6 +10,7 @@ const BROKERS = [
   { value: 'auto', label: 'Auto-detect' },
   { value: 'thinkorswim', label: 'Thinkorswim (Schwab)' },
   { value: 'ibkr', label: 'Interactive Brokers (IBKR)' },
+  { value: 'mt5', label: 'MetaTrader 5' },
   { value: 'generic', label: 'Other broker (generic template)' },
 ];
 
@@ -20,13 +22,15 @@ const BROKER_HELP = {
   auto: 'Pick a broker above, or leave Auto-detect and the importer will recognise a Thinkorswim account statement or an IBKR Activity Statement.',
   thinkorswim: <>Export from Thinkorswim desktop: <em>Monitor → Account Statement → export icon → Export to File (CSV)</em></>,
   ibkr: <>Export from IBKR Client Portal: <em>Performance &amp; Reports → Statements → Activity → pick the period → Download as CSV</em></>,
+  mt5: <>Export from MT5 with <em>ExportDealsCSV.mq5</em>. In Settings → Import, choose the broker server timezone <strong>before the first import</strong>. The import reads the file's own server time and corrects for daylight saving. Importing the same export again is safe — deals already recorded are skipped, so nothing needs deleting first. Changing the timezone later only affects trades imported after the change; clear this account's MT5 trades first if you need them re-dated.</>,
   generic: <>Copy your fills into the template, one row per execution. Buys and sells of the same symbol are grouped into round-trip trades automatically, the same way as a broker import.</>,
 };
 
 const BROKER_DROP_LABEL = {
-  auto: 'Drop your broker CSV (Thinkorswim or IBKR)',
+  auto: 'Drop your broker CSV (Thinkorswim, IBKR or MT5)',
   thinkorswim: 'Drop Thinkorswim account statement CSV',
   ibkr: 'Drop IBKR Activity Statement CSV',
+  mt5: 'Drop MT5 deal history CSV',
   generic: 'Drop your filled-in generic template CSV',
 };
 
@@ -37,6 +41,14 @@ function brokerFromAccount(account) {
   if (/thinkorswim|tos|schwab/.test(b)) return 'thinkorswim';
   return 'auto';
 }
+
+// Bars are market data, not account data: two accounts trading the same
+// symbol read the same candles, so the import needs no account picker.
+const BARS_HELP = <>Export with <em>ExportBarsCSV.mq5</em>. It writes one file per symbol
+  (like <span className="num">TDJournal_bars_EURUSD_M1.csv</span>) covering the hours around your
+  trades, in the same broker-server time as the deal export — so this uses the same server
+  timezone, and corrects for daylight saving the same way. Drop a file per symbol. Importing
+  the same file again refreshes it rather than duplicating it.</>;
 
 /* Shown on every broker choice, so someone whose broker is missing finds the
    way in before giving up. Expands into the column reference when the generic
@@ -49,7 +61,7 @@ const TEMPLATE_COLUMNS = [
   ['quantity', 'Required', 'Shares or contracts, always positive'],
   ['price', 'Required', 'Fill price per share or per contract'],
   ['commission', 'Optional', 'Fees for that fill. Blank means 0'],
-  ['asset_type', 'Optional', 'STOCK (default), OPTION or FUTURE'],
+  ['asset_type', 'Optional', `STOCK (default), ${INSTRUMENT_TYPES.filter(t => t !== 'STOCK').join(', ')}`],
   ['expiry, strike, put_call', 'Options', '2026-08-28, 765, CALL or PUT'],
   ['multiplier', 'Optional', 'Point value for a future the app does not know'],
 ];
@@ -174,6 +186,12 @@ export default function Import({ accounts, accountId }) {
   const [diaryResult, setDiaryResult] = useState(null);
   const [diaryError, setDiaryError] = useState(null);
 
+  // M1 bar import state
+  const [barsFile, setBarsFile] = useState(null);
+  const [importingBars, setImportingBars] = useState(false);
+  const [barsResult, setBarsResult] = useState(null);
+  const [barsError, setBarsError] = useState(null);
+
   const handleCsvImport = async () => {
     if (!csvFile || !csvAccountId) {
       setCsvError('Please select a file and an account.');
@@ -193,6 +211,26 @@ export default function Import({ accounts, accountId }) {
       setCsvError(e.response?.data?.error || e.message);
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleBarsImport = async () => {
+    if (!barsFile) {
+      setBarsError('Please choose a bar file.');
+      return;
+    }
+    setImportingBars(true);
+    setBarsResult(null);
+    setBarsError(null);
+    const fd = new FormData();
+    fd.append('file', barsFile);
+    try {
+      const res = await importApi.importBars(fd);
+      setBarsResult(res.data);
+    } catch (e) {
+      setBarsError(e.response?.data?.error || e.message);
+    } finally {
+      setImportingBars(false);
     }
   };
 
@@ -313,6 +351,52 @@ export default function Import({ accounts, accountId }) {
           </div>
 
           <GenericTemplateTip open={csvBroker === 'generic'} onUse={() => setCsvBroker('generic')} />
+        </section>
+
+        {/* M1 bars */}
+        <section className="card">
+          <h2 className="section-title" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <CandlestickChart size={18} color="var(--accent-line)" aria-hidden="true" />
+            Import M1 Bars
+          </h2>
+
+          <DropZone
+            label="Drop an M1 bar CSV (one symbol per file)"
+            accept=".csv"
+            onFile={setBarsFile}
+            file={barsFile}
+            icon={CandlestickChart}
+          />
+
+          <button
+            className="btn btn-primary"
+            style={{ width: '100%', justifyContent: 'center', marginTop: 16 }}
+            onClick={handleBarsImport}
+            disabled={importingBars || !barsFile}
+          >
+            {importingBars
+              ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Importing...</>
+              : <><Upload size={16} /> Import Bars</>}
+          </button>
+
+          {barsResult && (
+            <div className="notice pos" role="status" style={{ marginTop: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--result-pos)', fontWeight: 600, marginBottom: 4 }}>
+                <CheckCircle size={16} /> Bars Imported
+              </div>
+              <div style={{ fontSize: 14 }}>{barsResult.message}</div>
+            </div>
+          )}
+
+          {barsError && (
+            <div className="notice neg" role="alert" style={{ marginTop: 12 }}>
+              <AlertCircle size={14} style={{ marginRight: 6, verticalAlign: 'middle' }} />{barsError}
+            </div>
+          )}
+
+          <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-secondary)' }}>
+            {BARS_HELP}
+          </div>
         </section>
 
         {/* Diary Upload */}

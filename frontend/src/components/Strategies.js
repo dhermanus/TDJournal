@@ -4,6 +4,7 @@ import {
   ResponsiveContainer, Cell, PieChart, Pie
 } from 'recharts';
 import { kpisApi, insightsApi } from '../api';
+import { instrumentColor } from '../instruments';
 import { Sparkles } from 'lucide-react';
 
 const fmt$ = (v) => `$${Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
@@ -58,8 +59,6 @@ export default function Strategies({ accountId }) {
     winRate: val.count ? Math.round(val.wins / val.count * 100) : 0,
   }));
 
-  const INST_COLORS = { STOCK: '#5bb0d7', OPTION: '#e8a95c', FUTURE: '#6bc987' };
-
   return (
     <div>
       <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 20 }}>Strategies</h2>
@@ -110,7 +109,7 @@ export default function Strategies({ accountId }) {
                   label={({ name, pnl }) => `${name}: ${fmt$(pnl)}`}
                 >
                   {instrData.map((entry, i) => (
-                    <Cell key={i} fill={INST_COLORS[entry.name] || '#8f9297'} />
+                    <Cell key={i} fill={instrumentColor(entry.name)} />
                   ))}
                 </Pie>
                 <Tooltip formatter={fmt$} contentStyle={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6 }} />

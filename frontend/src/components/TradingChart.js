@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { createChart, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { chartApi } from '../api';
+import { toTs, fillTs, axisLabel } from './chartTime';
 
 // lightweight-charts paints to canvas and cannot resolve CSS var(), so colours
 // are read from the design tokens at render time. Fallbacks are the token values.
@@ -29,32 +30,14 @@ function chartTheme() {
   };
 }
 
-// lightweight-charts always renders its axis and crosshair labels using UTC getters,
-// with no timezone option. Alpaca's bars come back as true UTC ("...T14:07:00Z" for
-// 10:07 ET), so feeding them straight in shows UTC hours on the axis while execution
-// times are already stored as ET wall-clock. Fix: shift bar timestamps by the market's
-// UTC offset so the "UTC" the library reads back out is actually ET. Hardcoded to EDT
-// (UTC-4) for now, matching the rest of this file — no winter DST handling yet.
-const ET_UTC_OFFSET_SEC = 4 * 3600;
-
-const toTs = (isoUtcStr) => Math.floor(new Date(isoUtcStr).getTime() / 1000) - ET_UTC_OFFSET_SEC;
+// lightweight-charts formats time using UTC getters and has no timezone option.
+// `toTs` / `execToTs` live in ./chartTime so the ET-vs-UTC source handling is
+// testable on its own — see chartTime.test.js for why a marker and its candle
+// must stay on one timeline.
 
 // Daily/weekly bars are stamped at session open, already whole calendar days —
 // no ET/UTC shift needed there, just a straight epoch conversion.
 const toDayTs = (isoUtcStr) => Math.floor(new Date(isoUtcStr).getTime() / 1000);
-
-const execToTs = (dateStr, timeStr, bucketMin = 5) => {
-  if (!timeStr) return null;
-  const [h, m] = timeStr.slice(0, 5).split(':').map(Number);
-  const totalMin = Math.floor((h * 60 + m) / bucketMin) * bucketMin;
-  const rh = Math.floor(totalMin / 60);
-  const rm = totalMin % 60;
-  // Already ET wall-clock — parse as literal UTC so it lands in the same shifted
-  // timeline as toTs() above, instead of applying the offset a second time.
-  return Math.floor(
-    new Date(`${dateStr}T${String(rh).padStart(2, '0')}:${String(rm).padStart(2, '0')}:00Z`).getTime() / 1000
-  );
-};
 
 const avgPrice = (fills) => {
   const qty = fills.reduce((s, f) => s + (f.qty || 0), 0);
@@ -119,6 +102,10 @@ export default function TradingChart({
   const chartRef = useRef(null);
   const [timeframe, setTimeframe] = useState(defaultTimeframe);
   const [bars, setBars] = useState([]);
+  // Which feed answered: 'local' is imported broker bars (naive UTC, no ET
+  // shift, no US session), 'remote' is the Alpaca equity feed, and null is
+  // still loading — the axis label is held back until we know which it is.
+  const [source, setSource] = useState(null);
   const [daysBack, setDaysBack] = useState(() => INITIAL_DAYS_BACK[defaultTimeframe] || 1);
   const [warning, setWarning] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -145,6 +132,13 @@ export default function TradingChart({
   // fired the fetch once with the stale daysBack and again with the reset
   // value once it caught up.
   const selectionKeyRef = useRef(null);
+  // Mirrors `executions` for the fetch effect below. The window-widening check
+  // needs the fills, but listing `executions` in that effect's deps would make
+  // every fill edit re-fetch the chart — recording an exit would reload it.
+  // Kept in an effect rather than assigned during render so the first commit
+  // has a value before the fetch effect runs.
+  const executionsRef = useRef(executions);
+  useEffect(() => { executionsRef.current = executions; });
 
   useEffect(() => {
     const key = `${ticker}|${date}|${timeframe}`;
@@ -167,7 +161,27 @@ export default function TradingChart({
     const isInitialLoad = isInitialFetchRef.current;
     if (isInitialLoad) { setLoading(true); setBars([]); setWarning(null); }
     chartApi.get(ticker, date, timeframe, daysBack)
-      .then(r => { setBars(r.data.bars || []); setWarning(r.data.warning || null); })
+      .then(r => {
+        setBars(r.data.bars || []);
+        setWarning(r.data.warning || null);
+        const isLocal = r.data.source === 'local';
+        setSource(r.data.source === 'local' ? 'local' : 'remote');
+        // The request window reaches back `daysBack` days from the trade's
+        // *close* date. A fill from an earlier day sits outside it, so widen
+        // once to cover the earliest execution — otherwise that fill is plotted
+        // with no candles under it. Guarded so it cannot loop: the needed days
+        // only ever shrink relative to what has already been asked for.
+        if (isLocal) {
+          const fills = executionsRef.current.filter(f => f.date);
+          if (fills.some(f => f.date !== date)) {
+            const earliest = fills.map(f => f.date).sort()[0];
+            const span = Math.round(
+              (new Date(`${date}T00:00:00Z`) - new Date(`${earliest}T00:00:00Z`)) / 86400000
+            ) + 1;
+            if (span > daysBack) setDaysBack(span);
+          }
+        }
+      })
       .catch(() => { if (isInitialLoad) setWarning('Failed to load chart data'); })
       .finally(() => {
         if (isInitialLoad) setLoading(false);
@@ -181,7 +195,9 @@ export default function TradingChart({
 
     if (chartRef.current) { chartRef.current.remove(); chartRef.current = null; }
 
-    const barTs = isWide ? toDayTs : toTs;
+    // Wide views (daily/weekly) never took the ET shift and still do not —
+    // those bars are stamped at session open, already whole calendar days.
+    const barTs = (stamp) => (isWide ? toDayTs(stamp) : toTs(stamp, source === 'local'));
     const T = chartTheme();
     layersRef.current = { candles: null, vwap: [], markers: [], sl: null, target: null };
 
@@ -233,7 +249,12 @@ export default function TradingChart({
     // A session VWAP is the running cumulative average from the open, so it's
     // built here as a running sum rather than plotted bar-by-bar. Only meaningful
     // within a single session, so skip it on the daily/weekly wide-context view.
-    if (!isWide) {
+    //
+    // Local MT5 bars carry tick_volume but no per-bar vw, and trade 24 hours
+    // with no US session to reset against — so there is nothing to build a
+    // session VWAP from, and the legend hides the toggle rather than showing
+    // one that plots no line.
+    if (!isWide && source !== 'local') {
       // Restarts at 9:30 ET each day: bars are on the ET-shifted timeline, so the
       // UTC date and minutes read back out are ET. Pre-market and after-hours bars
       // get no VWAP. One line per session, so days are not joined to each other.
@@ -313,7 +334,11 @@ export default function TradingChart({
       const markers = executions
         .filter(f => f.time)
         .map(f => {
-          const ts = execToTs(date, f.time, bucketMin);
+          // Each fill is plotted on its own date, falling back to the trade's
+          // when it carries none. `date` is the trade's *close* date, so using
+          // it for every fill would move an entry from an earlier day onto the
+          // close date — four of 1,346 real positions span more than one day.
+          const ts = fillTs(f, date, bucketMin);
           if (!ts) return null;
           const isBuy = f.action === 'BOT';
           return {
@@ -337,6 +362,16 @@ export default function TradingChart({
     if (savedRangeRef.current) {
       chart.timeScale().setVisibleRange(savedRangeRef.current);
       savedRangeRef.current = null;
+    } else if (source === 'local' && layersRef.current.markers?.length) {
+      // Local bars trade 24h, so there is no US session to open on. Frame the
+      // window around the trade's own fills instead: the point of this chart is
+      // what happened between entry and exit, not the whole day around them.
+      const times = layersRef.current.markers.map(m => m.time);
+      const pad = Math.max((TF_MINUTES[timeframe] || 5) * 60 * 6, 60);
+      chart.timeScale().setVisibleRange({
+        from: Math.min(...times) - pad,
+        to: Math.max(...times) + pad,
+      });
     } else if (SESSION_TFS.has(timeframe)) {
       // Open on the trade day's regular session. Falls back to the whole load
       // when the day has no bars inside 9:30-16:00.
@@ -387,7 +422,7 @@ export default function TradingChart({
       chart.remove();
       chartRef.current = null;
     };
-  }, [bars, executions, side, analysis, height, loading, date, timeframe, isWide, daysBack]);
+  }, [bars, executions, side, analysis, height, loading, date, timeframe, isWide, daysBack, source]);
 
   useEffect(() => {
     visibleRef.current = visible;
@@ -398,7 +433,7 @@ export default function TradingChart({
   const legendItems = [
     { key: 'buy', label: 'Buy fill', swatch: { width: 9, height: 9, borderRadius: '50%', background: 'var(--result-pos)' } },
     { key: 'sell', label: 'Sell fill', swatch: { width: 9, height: 9, borderRadius: '50%', background: 'var(--result-neg)' } },
-    !isWide && { key: 'vwap', label: 'VWAP', swatch: { width: 16, height: 2, background: 'var(--text-secondary)' } },
+    !isWide && source !== 'local' && { key: 'vwap', label: 'VWAP', swatch: { width: 16, height: 2, background: 'var(--text-secondary)' } },
     analysis?.stop_loss && { key: 'sl', label: 'SL', swatch: { width: 16, height: 2, background: 'var(--caution)' } },
     analysis?.target_price && { key: 'target', label: 'Target', swatch: { width: 16, height: 2, background: 'var(--accent-line)' } },
   ].filter(Boolean);
@@ -411,6 +446,7 @@ export default function TradingChart({
       }}>
         <h2 className="section-title" style={{ fontSize: 17 }}>
           {ticker} · {TIMEFRAMES.find(t => t.id === timeframe)?.label} Chart · <span className="num text-muted" style={{ fontWeight: 500 }}>{date}</span>
+          <span className="text-muted" style={{ fontSize: 11, fontWeight: 500, marginLeft: 7 }}>{axisLabel(source)} axis</span>
         </h2>
         <div className="seg" role="group" aria-label="Chart timeframe">
           {TIMEFRAMES.map(tf => (

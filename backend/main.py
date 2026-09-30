@@ -16,7 +16,10 @@ from dotenv import load_dotenv
 import httpx
 
 from database import init_db, get_db, row_to_dict
-from csv_parser import parse_broker_csv, FUTURES_MULTIPLIERS
+from csv_parser import (
+    parse_broker_csv, parse_mt5_bars_csv, symbol_from_bar_filename, FUTURES_MULTIPLIERS,
+)
+import excursions
 from ai_analysis import (
     analyze_diary_entry,
     analyze_diary_text,
@@ -29,6 +32,8 @@ from ai_analysis import (
 )
 from daily_summary import build_daily_context, generate_daily_summary
 from library import router as library_router, init_library_tables, apply_aliases, library_names
+import instruments
+import mt5_time
 
 load_dotenv()
 
@@ -176,8 +181,78 @@ def put_goals(
     return json.loads(payload)
 
 
-# ── Accounts ───────────────────────────────────────────────────────────────────
+# ── MT5 server timezone ────────────────────────────────────────────────────────
+# MT5 exports raw broker-server time with no offset. This setting names the
+# IANA zone that server runs on, so a historical fill is converted with the
+# daylight-saving rule that applied *on that date* rather than today's offset.
 
+class Mt5TimezoneBody(BaseModel):
+    timezone: str
+
+
+def _mt5_timezone(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE account_id = 0 AND key = ?",
+        (mt5_time.SETTINGS_KEY_TIMEZONE,),
+    ).fetchone()
+    stored = row["value"] if row else ""
+    return mt5_time.resolve_timezone(stored, os.getenv("MT5_SERVER_TIMEZONE"))
+
+
+@app.get("/api/mt5/timezone")
+def get_mt5_timezone(conn: sqlite3.Connection = Depends(get_connection)):
+    row = conn.execute(
+        "SELECT value FROM settings WHERE account_id = 0 AND key = ?",
+        (mt5_time.SETTINGS_KEY_TIMEZONE,),
+    ).fetchone()
+    effective = _mt5_timezone(conn)
+    try:
+        zone = mt5_time.load_zone(effective)
+        error = None
+    except mt5_time.TimezoneError as exc:
+        zone = None
+        error = str(exc)
+    return {
+        "timezone": row["value"] if row else "",
+        "effective": effective,
+        "source": "setting" if row else (
+            "env" if os.getenv("MT5_SERVER_TIMEZONE") else "unset"
+        ),
+        "valid": zone is not None,
+        "error": error,
+        # This is a live sanity-check only; imports use the historical
+        # transition table, not this offset.
+        "current_offset_hours": (
+            datetime.now(zone).utcoffset().total_seconds() / 3600.0
+            if zone else None
+        ),
+        "candidates": mt5_time.CANDIDATE_ZONES,
+        "transitions": (
+            mt5_time.dst_summary(effective, 2025, 2028) if zone else []
+        ),
+    }
+
+
+@app.put("/api/mt5/timezone")
+def put_mt5_timezone(
+    body: Mt5TimezoneBody,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    name = body.timezone.strip()
+    try:
+        mt5_time.load_zone(name)
+    except mt5_time.TimezoneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    conn.execute(
+        """INSERT INTO settings (account_id, key, value) VALUES (0, ?, ?)
+           ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value""",
+        (mt5_time.SETTINGS_KEY_TIMEZONE, name),
+    )
+    conn.commit()
+    return get_mt5_timezone(conn=conn)
+
+
+# ── Accounts ───────────────────────────────────────────────────────────────────
 class AccountCreate(BaseModel):
     name: str
     type: str
@@ -363,7 +438,7 @@ def setup_stats(
                    ROUND(AVG(net_pnl), 2) AS avg,
                    SUM(CASE WHEN net_pnl < -500 THEN 1 ELSE 0 END) AS big_losses
             FROM trades
-            WHERE account_id = ? AND instrument_type='STOCK'
+            WHERE account_id = ?
               AND net_pnl IS NOT NULL AND net_pnl != 0 AND {group_col} IS NOT NULL
             GROUP BY {group_col} ORDER BY total DESC
         """, (account_id,)).fetchall()
@@ -428,7 +503,14 @@ async def import_csv(
     except UnicodeDecodeError:
         content = raw.decode('latin-1')
 
-    trades, skipped = parse_broker_csv(content, broker, account_id, conn)
+    # MT5 timestamps are broker-server local time; every other parser writes
+    # dates the file already states. Resolved here so the timezone setting is
+    # read from the same connection the import writes through.
+    trades, skipped = parse_broker_csv(
+        content, broker, account_id, conn, tz_name=_mt5_timezone(conn)
+    )
+    report = skipped if isinstance(skipped, dict) else None
+    skipped_deals = report.get("skipped_deals", skipped) if report else skipped
 
     imported = 0
     errors = []
@@ -469,10 +551,117 @@ async def import_csv(
 
     return {
         "imported": imported,
-        "skipped": skipped,
+        "skipped": skipped_deals,
         "errors": errors,
-        "message": (f"Imported {imported} trade group(s). "
-                    f"Skipped {skipped} duplicate execution(s)."),
+        "message": (
+            f"Imported {imported} MT5 position(s). "
+            f"Skipped {skipped_deals} previously imported deal(s). "
+            f"{report['open_positions']} position(s) remain open."
+            + _dst_note(report)
+            if report else
+            f"Imported {imported} trade group(s). "
+            f"Skipped {skipped_deals} duplicate execution(s)."
+        ),
+        "details": report,
+    }
+
+
+def _dst_note(report: dict) -> str:
+    """Warn when a deal landed on a clock change, where the offset is ambiguous.
+
+    On the spring-forward gap the local time does not exist and on the autumn
+    fallback it maps to two instants an hour apart; either way the converted
+    timestamp can be an hour off, which is worth saying out loud rather than
+    burying in `details`.
+    """
+    parts = []
+    if report.get("dst_nonexistent"):
+        parts.append(f"{report['dst_nonexistent']} deal(s) fell in a skipped clock hour")
+    if report.get("dst_ambiguous"):
+        parts.append(f"{report['dst_ambiguous']} deal(s) fell in a repeated clock hour")
+    if not parts:
+        return ""
+    return " Note: " + " and ".join(parts) + \
+        f" during a daylight-saving change of {report.get('tz', 'the server zone')} — check those times."
+
+
+@app.post("/api/import-bars")
+async def import_bars(
+    file: UploadFile = File(...),
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Store one M1 bar file and recompute the excursions it can cover.
+
+    Bars are market data, not account data: two accounts trading EURUSD read the
+    same candles, so there is no account to attach them to. What does change per
+    import is which trades get measured — those whose ticker the file names.
+    """
+    filename = (file.filename or "").lower()
+    if not filename.endswith('.csv'):
+        raise ValueError("Only .csv files are accepted")
+
+    raw = await file.read()
+    try:
+        content = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        content = raw.decode('latin-1')
+
+    # Same resolution path as the deal import, so bars and fills land on one
+    # timeline even if the zone is set after trades were already imported.
+    tz_name = _mt5_timezone(conn)
+    bars, report = parse_mt5_bars_csv(content, tz_name)
+
+    symbol = symbol_from_bar_filename(file.filename)
+    if not symbol:
+        raise ValueError(
+            "Could not tell which symbol this file is for. Name it "
+            "TDJournal_bars_<SYMBOL>_M1.csv, the name ExportBarsCSV.mq5 writes."
+        )
+
+    # Existing times are read once for the whole symbol. Checking per row would
+    # be 74,000 queries for a single EURUSD file, and SQLite reports rowcount 1
+    # for the DO UPDATE path anyway, so neither loop-local signal is free.
+    existing = {r[0] for r in conn.execute(
+        "SELECT time FROM bars WHERE symbol = ?", (symbol,))}
+    stored = 0
+    refreshed = 0
+    for bar in bars:
+        conn.execute("""
+            INSERT INTO bars (symbol, time, open, high, low, close, tick_volume)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, time) DO UPDATE SET
+                open=excluded.open, high=excluded.high, low=excluded.low,
+                close=excluded.close, tick_volume=excluded.tick_volume
+        """, (symbol, bar["time"], bar["open"], bar["high"],
+              bar["low"], bar["close"], bar["tick_volume"]))
+        if bar["time"] in existing:
+            refreshed += 1
+        else:
+            stored += 1
+
+    # One symbol in, so only that symbol's trades are re-measured. Clearing
+    # first means a trade whose bars just vanished cannot keep a stale number.
+    excursion = excursions.recompute(conn, [symbol])
+    conn.commit()
+
+    return {
+        "symbol": symbol,
+        "bars": report["bars"],
+        "stored": stored,
+        "refreshed": refreshed,
+        "first": report["first"],
+        "last": report["last"],
+        "measured": excursion["measured"],
+        "without_bars": excursion["without_bars"],
+        "message": (
+            f"Imported {report['bars']} {symbol} M1 bar(s) "
+            f"({stored} new, {refreshed} refreshed). "
+            f"Recomputed MFE/MAE for {excursion['measured']} trade(s)."
+            + (f" {excursion['without_bars']} trade(s) have no bars to measure."
+               if excursion["without_bars"] else "")
+            + _dst_note(report)
+        ),
+        "details": report,
     }
 
 
@@ -679,20 +868,30 @@ def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
     if is_open:
         gross_pnl, net_pnl = 0.0, 0.0
     else:
-        avg_entry = sum(e['qty'] * e['price'] for e in entry_fills) / entry_qty
-        avg_exit  = sum(e['qty'] * e['price'] for e in exit_fills)  / exit_qty
-        if instrument == 'OPTION':
-            multiplier = 100
-        elif instrument == 'FUTURE':
-            multiplier = next(
-                (v for k, v in FUTURES_MULTIPLIERS.items() if ticker.upper().startswith(k.upper())), 1
-            )
+        # Broker-reported profit wins when the export carried one. MT5 settles a
+        # pair's legs into account currency itself — a JPY price difference times
+        # contract size lands on 50,000, but the statement says 332.23 — so
+        # recomputing from prices would contradict the broker's own figures.
+        reported = [e for e in exit_fills if e.get('reported_profit') is not None]
+        if exit_fills and len(reported) == len(exit_fills):
+            gross_pnl = sum(e['reported_profit'] for e in reported)
+            commissions_total = sum(e.get('commission', 0) for e in execs)
+            net_pnl = round(gross_pnl - commissions_total, 2)
+            gross_pnl = round(gross_pnl, 2)
         else:
-            multiplier = 1
-        gross_pnl = (avg_entry - avg_exit if side == 'SHORT' else avg_exit - avg_entry) * entry_qty * multiplier
-        commissions_total = sum(e.get('commission', 0) for e in execs)
-        net_pnl   = round(gross_pnl - commissions_total, 2)
-        gross_pnl = round(gross_pnl, 2)
+            avg_entry = sum(e['qty'] * e['price'] for e in entry_fills) / entry_qty
+            avg_exit  = sum(e['qty'] * e['price'] for e in exit_fills)  / exit_qty
+            multiplier = instruments.units_per_lot(instrument, ticker, FUTURES_MULTIPLIERS)
+            if multiplier is None:
+                # Unknown futures point value: refusing beats understating /ES 50x.
+                raise ValueError(
+                    f"no known point value for {ticker}; add a multiplier before "
+                    f"this trade can be recomputed"
+                )
+            gross_pnl = (avg_entry - avg_exit if side == 'SHORT' else avg_exit - avg_entry) * entry_qty * multiplier
+            commissions_total = sum(e.get('commission', 0) for e in execs)
+            net_pnl   = round(gross_pnl - commissions_total, 2)
+            gross_pnl = round(gross_pnl, 2)
 
     commissions = round(sum(e.get('commission', 0) for e in execs), 2)
 
@@ -888,7 +1087,7 @@ def _excursion_kpis(conn, account_id=None, date_from=None, date_to=None) -> dict
     them is what calibrates the stop.
     """
     sql = ("SELECT net_pnl, mfe_pct, mae_pct, exit_efficiency FROM trades "
-           "WHERE instrument_type='STOCK' AND mfe_pct IS NOT NULL "
+           "WHERE mfe_pct IS NOT NULL "
            "AND net_pnl IS NOT NULL AND net_pnl <> 0")
     params = []
     if account_id is not None:
@@ -1279,12 +1478,108 @@ async def _fetch_alpaca_bars(client, url, base_params, headers, max_bars=5000):
     return bars
 
 
+def _local_chart_bars(conn, ticker: str, date: str, timeframe: str,
+                      days_back: int) -> dict | None:
+    """Read and optionally aggregate imported M1 bars for a chart request.
+
+    Returns None when the symbol has no local history (the caller may try the
+    configured remote provider) and a normal chart response when it does. A
+    window with no bars returns an empty local response, not None: don't fall
+    through to a different price source for a symbol that the user is charting
+    from their own broker data.
+
+    The chart's existing endpoint contract is `t` (ISO UTC), `o/h/l/c/v/vw`.
+    Imported M1 times are naive UTC strings, so append `Z` and do no offset
+    correction in the browser. Higher timeframes are aggregated from M1 bars
+    in UTC buckets; no synthetic candles are filled across absent data.
+    """
+    symbol = ticker.strip().upper()
+    exists = conn.execute(
+        "SELECT 1 FROM bars WHERE symbol = ? COLLATE NOCASE LIMIT 1", (symbol,)
+    ).fetchone()
+    if not exists:
+        return None
+
+    tf_minutes = {
+        "1Min": 1, "3Min": 3, "5Min": 5, "10Min": 10,
+        "15Min": 15, "30Min": 30, "1Hour": 60,
+    }
+    wide_days = {"1Day": 3650, "1Week": 5475}
+    days_back = min(days_back, wide_days.get(timeframe, 90))
+
+    try:
+        end_dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+    except ValueError:
+        raise ValueError("Chart date must be YYYY-MM-DD")
+    start_dt = end_dt - timedelta(days=days_back)
+    start, end = start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = conn.execute(
+        "SELECT time, open, high, low, close, tick_volume FROM bars "
+        "WHERE symbol = ? COLLATE NOCASE AND time >= ? AND time < ? ORDER BY time",
+        (symbol, start, end),
+    ).fetchall()
+
+    raw = [dict(r) for r in rows]
+    if timeframe == "1Week":
+        bucket = "week"
+    elif timeframe == "1Day":
+        bucket = "day"
+    else:
+        bucket = tf_minutes.get(timeframe, 5)
+
+    grouped = {}
+    for bar in raw:
+        stamp = bar["time"]
+        dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        if bucket == "week":
+            monday = (dt - timedelta(days=dt.weekday())).date()
+            key_dt = datetime.combine(monday, datetime.min.time())
+        elif bucket == "day":
+            key_dt = datetime.combine(dt.date(), datetime.min.time())
+        else:
+            minutes = int(bucket)
+            day_start = dt.replace(hour=0, minute=0, second=0)
+            elapsed = dt.hour * 60 + dt.minute
+            key_dt = day_start + timedelta(minutes=(elapsed // minutes) * minutes)
+        key = key_dt.strftime("%Y-%m-%d %H:%M:%S")
+        if key not in grouped:
+            grouped[key] = {
+                "t": key.replace(" ", "T") + "Z",
+                "o": float(bar["open"]), "h": float(bar["high"]),
+                "l": float(bar["low"]), "c": float(bar["close"]),
+                "v": int(bar["tick_volume"] or 0),
+            }
+        else:
+            agg = grouped[key]
+            agg["h"] = max(agg["h"], float(bar["high"]))
+            agg["l"] = min(agg["l"], float(bar["low"]))
+            agg["c"] = float(bar["close"])
+            agg["v"] += int(bar["tick_volume"] or 0)
+
+    return {
+        "ticker": symbol,
+        "original_ticker": ticker,
+        "date": date,
+        "bars": list(grouped.values()),
+        "source": "local",
+        "time_basis": "UTC",
+        "warning": None if grouped else f"No imported {symbol} bars in this date window.",
+    }
+
+
 @app.get("/api/chart/{ticker}/{date}")
 async def get_chart(
     ticker: str, date: str,
     timeframe: str = Query("5Min"),
     days_back: int = Query(1, ge=1),
+    conn: sqlite3.Connection = Depends(get_connection),
 ):
+    tf = timeframe if timeframe in ALLOWED_CHART_TIMEFRAMES else "5Min"
+    local = _local_chart_bars(conn, ticker, date, tf, days_back)
+    if local is not None:
+        return local
+
     if not ALPACA_KEY or ALPACA_KEY == "your_alpaca_api_key_here":
         return {
             "ticker": ticker, "date": date, "bars": [],
@@ -1297,8 +1592,6 @@ async def get_chart(
         alpaca_ticker = FUTURES_CHART_MAP.get(ticker.upper(), 'SPY')
     else:
         alpaca_ticker = ticker.upper()
-
-    tf = timeframe if timeframe in ALLOWED_CHART_TIMEFRAMES else "5Min"
 
     # Same knob as the intraday branch below (days_back widens the window when
     # the chart is zoomed out past what's loaded) — daily/weekly just start

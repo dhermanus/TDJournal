@@ -3,6 +3,7 @@ import { Search, ChevronUp, ChevronDown } from 'lucide-react';
 import { tradesApi } from '../api';
 import TradeRow from './TradeRow';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue } from './ui';
+import { INSTRUMENT_TYPES, INSTRUMENT_LABELS } from '../instruments';
 
 const PAGE_SIZE = 25;
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -157,9 +158,9 @@ export default function Trades({ accountId, initialDateFrom = '', initialDateTo 
           <label className="field-label" htmlFor="tv-type">Type</label>
           <select id="tv-type" value={instrType} onChange={e => setInstrType(e.target.value)} style={{ width: 140 }}>
             <option value="">All Types</option>
-            <option value="STOCK">Stock</option>
-            <option value="OPTION">Option</option>
-            <option value="FUTURE">Future</option>
+            {INSTRUMENT_TYPES.map(t => (
+              <option key={t} value={t}>{INSTRUMENT_LABELS[t]}</option>
+            ))}
           </select>
         </div>
         <div>
