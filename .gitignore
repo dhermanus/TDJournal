@@ -24,5 +24,12 @@ build/
 uploads/
 backend/uploads/
 
+# local backups (one-button archives + pre-migration snapshots)
+backups/
+backend/backups/
+# Only our own generated archives, not any .zip a fixture might ever add.
+tdjournal-backup-*.zip
+pre-migration-*.db
+
 # windows shortcuts
 *.lnk

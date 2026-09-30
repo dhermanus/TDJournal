@@ -115,6 +115,16 @@ export const mt5TimezoneApi = {
   get: () => api.get('/api/mt5/timezone'),
   put: (timezone) => api.put('/api/mt5/timezone', { timezone }),
 };
+
+export const backupApi = {
+  getDestination: () => api.get('/api/backup/destination'),
+  setDestination: (folder) => api.put('/api/backup/destination', { folder }),
+  list: () => api.get('/api/backup/archives'),
+  create: () => api.post('/api/backup'),
+  restore: (name) => api.post('/api/backup/restore', { name }),
+  exportUrl: (format) => `${API_BASE}/api/export?fmt=${encodeURIComponent(format)}`,
+};
+
 export const edgeReportApi = {
   get: (params) => api.get('/api/edge-report', { params }),
 };

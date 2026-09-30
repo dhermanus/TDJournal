@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Plus, Pencil, GitMerge, Trash2, Search } from 'lucide-react';
-import { libraryApi, mt5TimezoneApi } from '../api';
+import { libraryApi, mt5TimezoneApi, backupApi } from '../api';
 import { PageHeader } from './ui';
 
 const SECTIONS = [
@@ -8,6 +8,7 @@ const SECTIONS = [
   { id: 'source', label: 'Sources' },
   { id: 'tag', label: 'Tags' },
   { id: 'import', label: 'Import' },
+  { id: 'backup', label: 'Backup' },
 ];
 
 // Sections that read their count from the loaded library list. Anything else
@@ -35,6 +36,10 @@ const SECTION_COPY = {
 
 const errText = (e) => e?.response?.data?.detail || e?.response?.data?.error || e?.message || 'Something went wrong';
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+const fmtBytes = (n) => (n >= 1024 * 1024
+  ? `${(n / (1024 * 1024)).toFixed(1)} MB`
+  : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 /** One editable list: strategies, sources, or a single tag type. */
 function ItemList({ kind, tagType = '', title, sub, noun, items, onChanged }) {
@@ -407,6 +412,207 @@ function ImportSettings() {
 
 /** Backup, restore, and export. All local: an archive written to a folder on
  *  this machine, never to a network destination. */
+function BackupSettings() {
+  const [dest, setDest] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [archives, setArchives] = useState([]);
+  const [busy, setBusy] = useState(null);   // 'save' | 'backup' | restore name
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [restored, setRestored] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [d, list] = await Promise.all([backupApi.getDestination(), backupApi.list()]);
+      setDest(d.data);
+      setDraft(d.data?.folder || '');
+      setArchives(list.data?.archives || []);
+      setError(null);
+    } catch (e) {
+      setError(errText(e));
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const saveFolder = async () => {
+    setBusy('save'); setError(null); setNotice(null);
+    try {
+      const res = await backupApi.setDestination(draft.trim());
+      setDest(res.data);
+      setNotice('Backup folder saved.');
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runBackup = async () => {
+    setBusy('backup'); setError(null); setNotice(null); setRestored(null);
+    try {
+      const res = await backupApi.create();
+      setNotice(`${res.data.name} written — ${fmtBytes(res.data.size_bytes)}.`);
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Restoring writes to a *new* folder; the running journal is untouched, so
+  // there is nothing destructive to confirm here.
+  const runRestore = async (name) => {
+    setBusy(name); setError(null); setNotice(null); setRestored(null);
+    try {
+      const res = await backupApi.restore(name);
+      setRestored(res.data);
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const ready = dest?.exists;
+
+  return (
+    <section className="card" aria-label="Backup and export settings">
+      <div className="settings-head">
+        <div style={{ minWidth: 0 }}>
+          <h2 className="section-title">Backup &amp; export</h2>
+          <div className="section-sub">
+            A backup is a single archive containing the database <em>and</em> your
+            attached files, written through SQLite&apos;s own snapshot API so it is
+            consistent even while the app is running.
+          </div>
+        </div>
+      </div>
+
+      {notice && <div className="notice pos settings-notice" role="status">{notice}</div>}
+      {error && <div className="notice neg" role="alert">{error}</div>}
+
+      <div className="settings-form">
+        <label>
+          <span className="field-label">Backup folder (full path)</span>
+          <input
+            type="text"
+            value={draft}
+            placeholder="C:\Users\you\Documents\TDJournal-backups"
+            onChange={e => { setDraft(e.target.value); setNotice(null); }}
+            style={{ width: '100%' }}
+          />
+        </label>
+        <div className="settings-form-actions">
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={busy === 'save' || !draft.trim() || draft.trim() === dest?.folder}
+            onClick={saveFolder}
+          >
+            {busy === 'save' ? 'Saving…' : 'Save folder'}
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={busy !== null || !ready}
+            onClick={runBackup}
+          >
+            {busy === 'backup' ? 'Backing up…' : 'Create backup'}
+          </button>
+          <a
+            className="btn btn-ghost btn-sm"
+            href={backupApi.exportUrl('json')}
+            download="tdjournal-export.json"
+          >
+            Export JSON
+          </a>
+          <a
+            className="btn btn-ghost btn-sm"
+            href={backupApi.exportUrl('csv')}
+            download="tdjournal-export.csv.zip"
+          >
+            Export CSV
+          </a>
+        </div>
+      </div>
+
+      {!ready && (
+        <div className="section-sub" style={{ marginTop: 12 }}>
+          {dest?.set
+            ? 'The saved folder no longer exists. Choose another one to enable backups.'
+            : 'Choose a folder first — backups are written there, and the app remembers it.'}
+        </div>
+      )}
+
+      <h3 className="section-sub" style={{ marginTop: 20, fontWeight: 600 }}>
+        Backups {archives.length > 0 && <span className="text-muted num">({archives.length})</span>}
+      </h3>
+
+      {archives.length ? (
+        <table className="table" style={{ marginTop: 8 }}>
+          <thead>
+            <tr>
+              <th scope="col">Archive</th>
+              <th scope="col">Created</th>
+              <th scope="col">Contents</th>
+              <th scope="col" style={{ textAlign: 'right' }}>Restore</th>
+            </tr>
+          </thead>
+          <tbody>
+            {archives.map(a => (
+              <tr key={a.name}>
+                <td>
+                  <span title={a.name}>{a.name}</span>
+                  <div className="text-muted num" style={{ fontSize: 12 }}>
+                    {fmtBytes(a.size_bytes)}
+                    {a.alembic_revision ? ` · schema ${a.alembic_revision}` : ''}
+                  </div>
+                  {a.error && <div role="alert" style={{ color: 'var(--caution)', fontSize: 12 }}>{a.error}</div>}
+                </td>
+                <td className="num" style={{ whiteSpace: 'nowrap' }}>
+                  {(a.created_at || a.modified || '').replace('T', ' ').slice(0, 16)}
+                </td>
+                <td className="num" style={{ fontSize: 12 }}>
+                  {a.tables
+                    ? `${Object.keys(a.tables).length} tables · ${Object.values(a.tables).reduce((n, v) => n + v, 0)} rows`
+                    : '—'}
+                  <div className="text-muted">{a.attachment_files ?? 0} attached file(s)</div>
+                </td>
+                <td style={{ textAlign: 'right' }}>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    disabled={busy !== null || !!a.error}
+                    onClick={() => runRestore(a.name)}
+                  >
+                    {busy === a.name ? 'Restoring…' : 'Restore'}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <p className="text-muted" style={{ fontSize: 13 }}>
+          No backups yet. Restore writes into a new folder beside the archive so you can
+          inspect it — it never replaces the journal you are using.
+        </p>
+      )}
+
+      {restored && (
+        <div className="notice pos settings-notice" role="status" style={{ marginTop: 14 }}>
+          Restored {restored.restored_members} file(s) to <strong>{restored.folder}</strong>.
+          {restored.manifest?.created_at && ` From a backup made ${restored.manifest.created_at}.`}
+          The running journal was not changed.
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function Settings() {
   const [lib, setLib] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -491,6 +697,7 @@ export default function Settings() {
           </div>
         )}
         {section === 'import' && <ImportSettings />}
+        {section === 'backup' && <BackupSettings />}
       </div>
     </div>
   );

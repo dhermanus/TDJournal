@@ -2,7 +2,7 @@
 // Settings library behaves. The api module is mocked, so no test reaches a backend.
 import { render, screen, within, fireEvent, waitFor, act } from '@testing-library/react';
 import App from './App';
-import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, mt5TimezoneApi, chartApi, attachmentsApi, __restoreMocks } from './api';
+import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, mt5TimezoneApi, chartApi, attachmentsApi, backupApi, __restoreMocks } from './api';
 import TradeDetail from './components/TradeDetail';
 import { clipboardFiles } from './useFilePaste';
 
@@ -11,6 +11,7 @@ jest.mock('./api', () => {
   // CRA's jest preset resets mocks before each test, so every mock keeps its
   // implementation and __restoreMocks puts it back in beforeEach.
   const all = [];
+  const backupState = { folder: '', set: false, exists: false };
   const fn = (impl) => { const f = jest.fn(impl); f.impl = impl; all.push(f); return f; };
   const TRADE = {
     id: 101, account_id: 1, trade_group: '9/10/26_TSLA_STOCK_1', date: '2026-09-10', ticker: 'TSLA',
@@ -64,7 +65,12 @@ jest.mock('./api', () => {
     get: (target, key) => (key in target ? target[key] : fn(() => ok({}))),
   });
   return {
-    __restoreMocks: () => all.forEach(f => f.mockImplementation(f.impl)),
+    // Each test starts with no backup folder chosen; without this the folder
+    // saved by one test would leak into the next and leave Backup enabled.
+    __restoreMocks: () => {
+      Object.assign(backupState, { folder: '', set: false, exists: false });
+      all.forEach(f => f.mockImplementation(f.impl));
+    },
     API_BASE: 'http://mocked.invalid',
     accountsApi: withDefault({
       list: fn(() => ok(ACCOUNTS)),
@@ -102,6 +108,19 @@ jest.mock('./api', () => {
     mt5TimezoneApi: withDefault({
       get: fn(() => ok(MT5_TIMEZONE)),
       put: fn(() => ok({ ...MT5_TIMEZONE, timezone: 'Europe/London', effective: 'Europe/London', source: 'setting', valid: true })),
+    }),
+    backupApi: withDefault({
+      // Stateful: saving a folder then re-reading it is the real sequence, so a
+      // stub that always answered "" would un-disable the button again.
+      getDestination: fn(() => ok(backupState)),
+      setDestination: fn((folder) => {
+        Object.assign(backupState, { folder, set: true, exists: true });
+        return ok({ ...backupState });
+      }),
+      list: fn(() => ok({ folder: backupState.folder, archives: [] })),
+      create: fn(() => ok({ name: 'tdjournal-backup.zip', size_bytes: 1024, folder: backupState.folder })),
+      restore: fn(name => ok({ folder: '/tmp/restored', name, restored_members: 4, manifest: {} })),
+      exportUrl: fn(fmt => `http://mocked.invalid/api/export?fmt=${fmt}`),
     }),
     attachmentsApi: withDefault({
       list: fn(() => ok({ attachments: [] })),
@@ -532,12 +551,12 @@ test('Day Review keeps the loss-streak alert and its Dismiss control', async () 
   expect(screen.getByRole('button', { name: /Regenerate AI/ })).toBeInTheDocument();
 });
 
-test('Settings has Strategies, Sources, Tags, Import sections, and Tags leaves out strategy and source types', async () => {
+test('Settings has Strategies, Sources, Tags, Import and Backup sections, and Tags leaves out strategy and source types', async () => {
   await renderApp();
   fireEvent.click(within(nav()).getByRole('button', { name: 'Settings' }));
   const tablist = await screen.findByRole('tablist', { name: 'Settings sections' });
   expect(within(tablist).getAllByRole('tab').map(t => t.textContent.replace(/\d+/g, '').trim()))
-    .toEqual(['Strategies', 'Sources', 'Tags', 'Import']);
+    .toEqual(['Strategies', 'Sources', 'Tags', 'Import', 'Backup']);
   expect(await screen.findByText('VWAP Cross')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Edit VWAP Cross' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Delete VWAP Cross' })).toBeInTheDocument();
@@ -579,6 +598,35 @@ test('Settings Import names the MT5 server timezone and saves it', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Save timezone' }));
   await waitFor(() => expect(mt5TimezoneApi.put).toHaveBeenCalledWith('Europe/London'));
   expect(await screen.findByRole('status')).toHaveTextContent(/Saved Europe\/London/);
+});
+
+test('Settings Backup names a folder before backing up, and restores beside the archive', async () => {
+  await renderApp();
+  fireEvent.click(within(nav()).getByRole('button', { name: 'Settings' }));
+  const tablist = await screen.findByRole('tablist', { name: 'Settings sections' });
+  fireEvent.click(within(tablist).getByRole('tab', { name: /Backup/ }));
+
+  const section = await screen.findByRole('region', { name: 'Backup and export settings' });
+  expect(within(section).getByText(/Choose a folder first/)).toBeInTheDocument();
+  // Backups stay disabled until a folder is chosen: an archive has to land
+  // somewhere, and a silent default folder would be a surprise.
+  expect(within(section).getByRole('button', { name: 'Create backup' })).toBeDisabled();
+
+  fireEvent.change(within(section).getByLabelText(/Backup folder/), {
+    target: { value: 'C:\\journal\\backups' },
+  });
+  fireEvent.click(within(section).getByRole('button', { name: 'Save folder' }));
+  await waitFor(() => expect(backupApi.setDestination).toHaveBeenCalledWith('C:\\journal\\backups'));
+
+  fireEvent.click(await within(section).findByRole('button', { name: 'Create backup' }));
+  await waitFor(() => expect(backupApi.create).toHaveBeenCalled());
+  expect(await within(section).findByRole('status')).toHaveTextContent(/tdjournal-backup\.zip/);
+
+  // Both export formats are plain downloads, so nothing here waits on JS.
+  expect(within(section).getByRole('link', { name: 'Export JSON' }))
+    .toHaveAttribute('href', expect.stringContaining('fmt=json'));
+  expect(within(section).getByRole('link', { name: 'Export CSV' }))
+    .toHaveAttribute('href', expect.stringContaining('fmt=csv'));
 });
 
 test('Settings delete asks to reassign and can leave trades blank', async () => {

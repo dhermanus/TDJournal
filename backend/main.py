@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import tempfile
 import aiofiles
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -10,12 +11,14 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import httpx
 
 from database import init_db, get_db, row_to_dict
+import database
 import attachments
 from csv_parser import (
     parse_broker_csv, parse_mt5_bars_csv, symbol_from_bar_filename, FUTURES_MULTIPLIERS,
@@ -35,6 +38,7 @@ from daily_summary import build_daily_context, generate_daily_summary
 from library import router as library_router, init_library_tables, apply_aliases, library_names
 import instruments
 import mt5_time
+import backup
 
 load_dotenv()
 
@@ -1151,6 +1155,175 @@ def delete_trade_tag(tag_id: int, conn: sqlite3.Connection = Depends(get_connect
     conn.execute("DELETE FROM trade_tags WHERE id=?", (tag_id,))
     conn.commit()
     return {"deleted": True, "id": tag_id}
+
+
+# ── Backup, restore, export ───────────────────────────────────────────────────
+# Everything here stays local: the archive is written to a folder you choose on
+# this machine, and restore only ever extracts into a *new* folder so the running
+# journal is never replaced by an operation a button could have fumbled.
+
+SETTINGS_KEY_BACKUP_FOLDER = "backup_folder"
+EXPORT_TEMP_DIR = Path(tempfile.gettempdir()) / "tdjournal-export"
+
+
+class BackupDestinationBody(BaseModel):
+    folder: str
+
+
+def _backup_folder(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE account_id = 0 AND key = ?",
+        (SETTINGS_KEY_BACKUP_FOLDER,),
+    ).fetchone()
+    return row["value"] if row and row["value"] else ""
+
+
+def _resolve_backup_folder(folder: str) -> Path:
+    """Validate a user-entered path. Raises ValueError so it maps to a 400."""
+    if not folder or not folder.strip():
+        raise ValueError("Choose a folder for backups first.")
+    path = Path(folder.strip()).expanduser()
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"Not a folder: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Folder does not exist: {path}")
+    # The folder must be writable, checked by trying rather than guessing —
+    # a destination that will fail only at the end of a long archive is worse
+    # than one that refuses immediately.
+    try:
+        probe = backup.unique_path(path, ".tdjournal-write-probe")
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        raise ValueError(f"That folder is not writable: {exc}") from exc
+    return path
+
+
+@app.get("/api/backup/destination")
+def get_backup_destination(conn: sqlite3.Connection = Depends(get_connection)):
+    folder = _backup_folder(conn)
+    return {
+        "folder": folder,
+        "set": bool(folder),
+        "exists": bool(folder) and Path(folder).expanduser().is_dir(),
+    }
+
+
+@app.put("/api/backup/destination")
+def put_backup_destination(
+    body: BackupDestinationBody,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    # Validated here rather than only on use: a stale path remembered from a
+    # deleted folder should be reported when it is entered, not at backup time.
+    _resolve_backup_folder(body.folder)
+    conn.execute(
+        """INSERT INTO settings (account_id, key, value) VALUES (0, ?, ?)
+           ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value""",
+        (SETTINGS_KEY_BACKUP_FOLDER, body.folder.strip()),
+    )
+    conn.commit()
+    return get_backup_destination(conn=conn)
+
+
+@app.get("/api/backup/archives")
+def list_backup_archives(conn: sqlite3.Connection = Depends(get_connection)):
+    folder = _backup_folder(conn)
+    if not folder or not Path(folder).expanduser().is_dir():
+        return {"folder": folder, "archives": []}
+    target = Path(folder).expanduser()
+    archives = []
+    for path in sorted(target.glob("*.zip"), reverse=True):
+        try:
+            info = backup.inspect_archive(path)
+            manifest = info["manifest"]
+        except backup.RestoreError as exc:
+            # Listed anyway, marked unreadable: silently hiding a corrupt file
+            # would leave the user believing they have a backup they cannot use.
+            manifest, corrupt = {}, str(exc)
+        else:
+            corrupt = None
+        archives.append({
+            "name": path.name,
+            "size_bytes": path.stat().st_size,
+            "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+            "created_at": manifest.get("created_at"),
+            "alembic_revision": manifest.get("alembic_revision"),
+            "tables": manifest.get("tables", {}),
+            "attachment_files": manifest.get("attachment_files"),
+            "error": corrupt,
+        })
+    return {"folder": str(target), "archives": archives}
+
+
+@app.post("/api/backup")
+def create_backup(conn: sqlite3.Connection = Depends(get_connection)):
+    folder = _resolve_backup_folder(_backup_folder(conn))
+    path = backup.create_backup(
+        db_path=database.DB_PATH, upload_dir=UPLOAD_DIR, destination=folder,
+    )
+    return {
+        "created": str(path),
+        "name": path.name,
+        "size_bytes": path.stat().st_size,
+        "folder": str(folder),
+    }
+
+
+class RestoreBody(BaseModel):
+    name: str
+
+
+@app.post("/api/backup/restore")
+def restore_backup(body: RestoreBody, conn: sqlite3.Connection = Depends(get_connection)):
+    """Extract an archive into a *new* folder beside the backup.
+
+    Deliberately never writes over the live journal: restoring is something you
+    do to inspect or recover a copy, and replacing the running database in the
+    same action that could have been a mis-click is not a trade worth making.
+    The path is matched by name against the listing rather than joined to user
+    input, so `../../x` cannot select a file outside the backup folder.
+    """
+    folder = _resolve_backup_folder(_backup_folder(conn))
+    folder_resolved = folder.resolve()
+    if ".." in Path(body.name).parts or Path(body.name).name != body.name:
+        raise ValueError("Backup name must be a plain file name.")
+
+    archive = (folder / body.name).resolve()
+    if folder_resolved not in archive.parents or archive.suffix.lower() != ".zip":
+        raise ValueError("That backup is not in your backup folder.")
+
+    target = backup.unique_path(folder, archive.stem + "-restored")
+    target.mkdir(parents=True, exist_ok=True)
+    if any(target.iterdir()):
+        raise ValueError(f"Restore folder already exists and is not empty: {target.name}")
+    if target.resolve() == Path(database.DB_PATH).resolve().parent.resolve():
+        raise ValueError("Refusing to restore over the running journal folder.")
+
+    result = backup.extract_archive(archive, target)
+    result["folder"] = str(target)
+    result["name"] = target.name
+    return result
+
+
+@app.get("/api/export")
+def export_journal(fmt: str = "csv", conn: sqlite3.Connection = Depends(get_connection)):
+    """Every table as CSV (a zip) or JSON, written then streamed out."""
+    if fmt not in ("csv", "json"):
+        raise ValueError("Format must be csv or json.")
+    EXPORT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    destination = EXPORT_TEMP_DIR / f"tdjournal-export-{stamp}.{'zip' if fmt == 'csv' else 'json'}"
+    try:
+        backup.write_export(conn, destination, fmt=fmt)
+    except OSError as exc:
+        raise ValueError(f"Export could not be written: {exc}") from exc
+    media = "application/zip" if fmt == "csv" else "application/json"
+    return FileResponse(
+        destination, media_type=media, filename=destination.name,
+        headers={"X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(lambda: destination.unlink(missing_ok=True)),
+    )
 
 
 # ── KPIs ───────────────────────────────────────────────────────────────────────
