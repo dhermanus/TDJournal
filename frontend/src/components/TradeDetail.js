@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { ArrowLeft, ChevronLeft, ChevronRight, PlusCircle, Trash2, Pencil } from 'lucide-react';
 import { tradesApi, chartApi } from '../api';
+import AttachmentsPanel from './AttachmentsPanel';
+import useFilePaste from '../useFilePaste';
 import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
 import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
@@ -190,7 +192,7 @@ function TagBadge({ tag, onDelete }) {
 
 // ── What If helpers ───────────────────────────────────────────────────────────
 
-const TABS = ['Stats', 'Strategy', 'Tags', 'Executions', 'What If'];
+const TABS = ['Stats', 'Strategy', 'Tags', 'Executions', 'Files', 'What If'];
 
 const SCENARIOS = [
   { label: '+5 min',    offsetMin: 5 },
@@ -323,6 +325,24 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
   // What If
   const [whatIfBars, setWhatIfBars]       = useState(null);
   const [whatIfLoading, setWhatIfLoading] = useState(false);
+
+  // Files. A paste lands wherever the user happens to be, so it is captured
+  // here and handed to the panel rather than only being caught by a listener
+  // inside a tab that may not be mounted. Switching to Files on paste makes the
+  // upload visible instead of happening somewhere the user isn't looking.
+  const [pastedFiles, setPastedFiles] = useState([]);
+  const handlePaste = useCallback((files) => {
+    setPastedFiles(Array.from(files));
+    setTab('Files');
+  }, []);
+  useFilePaste(handlePaste);
+  const filesPanel = trade
+    ? <AttachmentsPanel
+        tradeGroup={trade.trade_group}
+        pendingFiles={pastedFiles}
+        onFilesConsumed={() => setPastedFiles([])}
+      />
+    : null;
 
   // Stats edit
   const [editingStats, setEditingStats]   = useState(false);
@@ -992,6 +1012,20 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 )}
               </div>
             )}
+
+            {/* ── Files tab ─────────────────────────────────────────────── */}
+            {/* Always mounted, hidden by display when another tab is up: the
+                panel owns the upload list, and a paste arriving from Stats
+                must not remount it mid-upload. display:none keeps it out of
+                the accessibility tree while inactive. */}
+            <div
+              style={{ paddingTop: 10, display: tab === 'Files' ? undefined : 'none' }}
+              role="tabpanel"
+              id="td-panel-files"
+              aria-labelledby="td-tab-Files"
+            >
+              {filesPanel}
+            </div>
 
             {/* ── What If tab ───────────────────────────────────────────── */}
             {tab === 'What If' && (

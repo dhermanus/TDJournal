@@ -31,6 +31,23 @@ export const tradesApi = {
   deleteExecution: (id, idx) => api.delete(`/api/trades/${id}/executions/${idx}`),
 };
 
+// Files attached to a trade's review (screenshots, statements, notes).
+export const attachmentsApi = {
+  list: (group) => api.get(`/api/trades/${encodeURIComponent(group)}/attachments`),
+  upload: (group, formData) => api.post(
+    `/api/trades/${encodeURIComponent(group)}/attachments`, formData,
+    { headers: { 'Content-Type': 'multipart/form-data' } },
+  ),
+  remove: (id) => api.delete(`/api/attachments/${id}`),
+  // A download, not an axios call: it has to leave the page so the browser
+  // saves the file rather than handing the bytes to JS. No `inline` here on
+  // purpose — this is the save-a-copy path.
+  downloadUrl: (id) => `${API_BASE}/api/attachments/${id}/download`,
+  // The preview box reads from the same guarded route with `inline=true`.
+  // The server ignores the flag for anything a browser cannot render.
+  previewUrl: (id) => `${API_BASE}/api/attachments/${id}/download?inline=true`,
+};
+
 export const importApi = {
   importCsv: (formData) => api.post('/api/import-csv', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }

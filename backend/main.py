@@ -9,13 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import httpx
 
 from database import init_db, get_db, row_to_dict
+import attachments
 from csv_parser import (
     parse_broker_csv, parse_mt5_bars_csv, symbol_from_bar_filename, FUTURES_MULTIPLIERS,
 )
@@ -968,10 +969,88 @@ def delete_trade(trade_id: int, conn: sqlite3.Connection = Depends(get_connectio
 
     conn.execute("DELETE FROM trade_tags WHERE trade_group=?", (trade_group,))
     conn.execute("DELETE FROM trade_analysis WHERE trade_group=?", (trade_group,))
+    # Files go too — leaving them would orphan bytes on disk that no row names.
+    attachments.remove_for_trade(conn, upload_dir=UPLOAD_DIR, trade_group=trade_group)
     conn.execute("DELETE FROM trades WHERE id=?", (trade_id,))
     conn.commit()
 
     return {"deleted": True, "id": trade_id}
+
+
+# ── Trade attachments ─────────────────────────────────────────────────────────
+# Files attached to one trade's review. Storage rules (allowlist, generated
+# filename, size cap, path containment) live in attachments.py.
+
+def _attachment_trade(conn, trade_group: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT id, trade_group FROM trades WHERE trade_group=? LIMIT 1", (trade_group,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    return row
+
+
+@app.get("/api/trades/{trade_group:path}/attachments")
+def list_trade_attachments(trade_group: str, conn: sqlite3.Connection = Depends(get_connection)):
+    _attachment_trade(conn, trade_group)
+    return {"attachments": attachments.list_for(conn, trade_group)}
+
+
+@app.post("/api/trades/{trade_group:path}/attachments", status_code=201)
+async def upload_trade_attachment(
+    trade_group: str,
+    file: UploadFile = File(...),
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    _attachment_trade(conn, trade_group)
+    # Read the whole file rather than streaming it: the limit must be enforced
+    # before a byte reaches disk, so an oversized upload is rejected outright
+    # rather than written and then trimmed.
+    raw = await file.read()
+    return attachments.save(
+        conn,
+        upload_dir=UPLOAD_DIR,
+        trade_group=trade_group,
+        filename=file.filename,
+        content_type=file.content_type,
+        raw=raw,
+    )
+
+
+@app.get("/api/attachments/{attachment_id}/download")
+def download_trade_attachment(
+    attachment_id: int,
+    inline: bool = False,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    meta = attachments.get(conn, attachment_id)
+    path = attachments.attachment_path(UPLOAD_DIR, meta["stored_name"])
+    if not path.is_file():
+        raise FileNotFoundError(f"Attachment file for {meta['original_name']} is missing")
+
+    # `inline` is a request hint, not a licence: only extensions the browser can
+    # actually render may leave this route inside a page. Everything else falls
+    # back to an attachment, which is the safe default (and the download dialog
+    # the user expects for a spreadsheet or a Word file).
+    show_inline = inline and attachments.is_inline_preview(meta["original_name"])
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if show_inline and (meta.get("content_type") or "").startswith("text/"):
+        # Rendered inside a sandboxed iframe; pin that down server-side too, so
+        # a .csv or .md that begins with markup still cannot run script.
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+    return FileResponse(
+        path,
+        media_type=meta["content_type"],
+        filename=meta["original_name"],          # also drives media_type fallback
+        headers=headers,
+        content_disposition_type="inline" if show_inline else "attachment",
+    )
+
+
+@app.delete("/api/attachments/{attachment_id}")
+def delete_trade_attachment(attachment_id: int, conn: sqlite3.Connection = Depends(get_connection)):
+    attachments.remove(conn, upload_dir=UPLOAD_DIR, attachment_id=attachment_id)
+    return {"deleted": True, "id": attachment_id}
 
 
 @app.get("/api/trades/{trade_group:path}/analysis")

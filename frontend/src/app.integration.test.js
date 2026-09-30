@@ -2,7 +2,9 @@
 // Settings library behaves. The api module is mocked, so no test reaches a backend.
 import { render, screen, within, fireEvent, waitFor, act } from '@testing-library/react';
 import App from './App';
-import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, mt5TimezoneApi, chartApi, __restoreMocks } from './api';
+import { accountsApi, tradesApi, libraryApi, kpisApi, goalsApi, mt5TimezoneApi, chartApi, attachmentsApi, __restoreMocks } from './api';
+import TradeDetail from './components/TradeDetail';
+import { clipboardFiles } from './useFilePaste';
 
 jest.mock('./api', () => {
   const ok = (data) => Promise.resolve({ data });
@@ -101,6 +103,13 @@ jest.mock('./api', () => {
       get: fn(() => ok(MT5_TIMEZONE)),
       put: fn(() => ok({ ...MT5_TIMEZONE, timezone: 'Europe/London', effective: 'Europe/London', source: 'setting', valid: true })),
     }),
+    attachmentsApi: withDefault({
+      list: fn(() => ok({ attachments: [] })),
+      upload: fn(() => ok({})),
+      remove: fn(() => ok({})),
+      downloadUrl: fn(id => `http://mocked.invalid/api/attachments/${id}/download`),
+      previewUrl: fn(id => `http://mocked.invalid/api/attachments/${id}/download?inline=true`),
+    }),
   };
 });
 
@@ -121,6 +130,226 @@ async function renderApp() {
 }
 
 const nav = () => screen.getByRole('navigation', { name: 'Main' });
+
+// ── Attachments ────────────────────────────────────────────────────────────
+// The window-level paste listener and the Files tab are the two things that
+// only exist together: a screenshot copied elsewhere in the app has to land on
+// the open trade, not be swallowed because the user was looking at Stats.
+describe('trade attachments', () => {
+  const TRADE = {
+    id: 101, account_id: 1, trade_group: '9/10/26_TSLA_STOCK_1', date: '2026-09-10', ticker: 'TSLA',
+    instrument_type: 'STOCK', side: 'LONG', gross_pnl: 195, net_pnl: 193.45, commissions: 1.55,
+    executions: [
+      { date: '2026-09-10', time: '09:54:10', action: 'BOT', qty: 200, price: 366.09, commission: 0 },
+      { date: '2026-09-10', time: '10:08:24', action: 'SOLD', qty: 200, price: 367.07, commission: 1.55 },
+    ],
+  };
+
+  const renderTrade = async () => {
+    render(<TradeDetail trade={TRADE} />);
+    await waitFor(() => expect(attachmentsApi.list).toHaveBeenCalledWith('9/10/26_TSLA_STOCK_1'));
+    await act(async () => {});
+  };
+
+  const pasteFiles = (clipboardData, target = document.body) => {
+    // jsdom's ClipboardEvent is inconsistent across versions; mimic the native
+    // DataTransfer properties the production helper reads.
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+    act(() => { target.dispatchEvent(event); });
+    return event;
+  };
+
+  test('extracts Lightshot-style image files exposed only through clipboard items', () => {
+    const image = new File(['png bytes'], 'lightshot.png', { type: 'image/png' });
+    const clipboardData = {
+      files: [],
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+    };
+    expect(clipboardFiles(clipboardData)).toEqual([image]);
+  });
+
+  test('deduplicates the same image exposed through files and items', () => {
+    const image = new File(['png bytes'], 'lightshot.png', { type: 'image/png' });
+    const clipboardData = {
+      files: [image],
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+    };
+    expect(clipboardFiles(clipboardData)).toEqual([image]);
+  });
+
+  test('the Files tab is offered and lists nothing until something is attached', async () => {
+    await renderTrade();
+    const tabs = screen.getAllByRole('tab').map(t => t.textContent);
+    expect(tabs).toEqual(['Stats', 'Strategy', 'Tags', 'Executions', 'Files', 'What If']);
+    // The list request fires even while Stats is showing: the panel stays
+    // mounted so a paste never has to mount it first.
+    expect(attachmentsApi.list).toHaveBeenCalledWith('9/10/26_TSLA_STOCK_1');
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Files' }));
+    expect(await screen.findByText(/No attachments yet/)).toBeInTheDocument();
+  });
+
+  test('a pasted image is uploaded once even when a pending-file effect reruns', async () => {
+    attachmentsApi.upload.mockImplementation(() => Promise.resolve({
+      data: {
+        id: 7, trade_group: '9/10/26_TSLA_STOCK_1', original_name: 'pasted-image.png',
+        stored_name: 'abc.png', content_type: 'image/png', size_bytes: 12, kind: 'image',
+      },
+    }));
+    await renderTrade();
+
+    // Lightshot-style: the image is only on clipboardData.items.
+    const image = new File(['x'], '', { type: 'image/png' });
+    pasteFiles({ files: [], items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }] });
+    await screen.findByText('pasted-image.png');
+    // Wait a beat for state updates after completion; the same array/callback
+    // combination must not cause the panel effect to submit the file again.
+    await act(async () => {});
+    expect(attachmentsApi.upload).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('a pasted image is sent with a name the backend allowlist can validate', async () => {
+    attachmentsApi.upload.mockImplementation(() => Promise.resolve({
+      data: {
+        id: 7, trade_group: '9/10/26_TSLA_STOCK_1', original_name: 'pasted-image.png',
+        stored_name: 'abc.png', content_type: 'image/png', size_bytes: 12, kind: 'image',
+      },
+    }));
+    await renderTrade();
+
+    // Pasted from the Stats tab — the tab has to follow the file.
+    pasteFiles({ files: [new File(['x'], '', { type: 'image/png' })], items: [] });
+
+    await waitFor(() => expect(attachmentsApi.upload).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true');
+
+    const form = attachmentsApi.upload.mock.calls[0][1];
+    // A clipboard blob has no name; the panel supplies one so the backend
+    // allowlist has an extension to validate.
+    expect(form.get('file').name).toBe('pasted-image.png');
+    expect(await screen.findByText('pasted-image.png')).toBeInTheDocument();
+  });
+
+  test('an unsupported file is refused before it is sent', async () => {
+    await renderTrade();
+    pasteFiles({ files: [new File(['MZ'], 'payload.exe', { type: 'application/x-msdownload' })], items: [] });
+
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent(/can’t be attached/);
+    expect(attachmentsApi.upload).not.toHaveBeenCalled();
+  });
+
+  test('a file over 50 MB is refused before it is sent', async () => {
+    await renderTrade();
+    const huge = { name: 'huge.png', size: 50 * 1024 * 1024 + 1, type: 'image/png' };
+    pasteFiles({ files: [huge], items: [] });
+
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent(/over the 50 MB/);
+    expect(attachmentsApi.upload).not.toHaveBeenCalled();
+  });
+
+  test('preview opens in an expandable popup; unsupported formats only download', async () => {
+    attachmentsApi.list.mockImplementation(() => Promise.resolve({ data: { attachments: [
+      { id: 1, original_name: 'chart.png', kind: 'image', content_type: 'image/png', size_bytes: 128, previewable: true },
+      { id: 2, original_name: 'statement.pdf', kind: 'file', content_type: 'application/pdf', size_bytes: 2048, previewable: true },
+      { id: 3, original_name: 'fills.csv', kind: 'file', content_type: 'text/csv', size_bytes: 64, previewable: true },
+      { id: 4, original_name: 'journal.xlsx', kind: 'file', content_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', size_bytes: 512, previewable: false },
+    ] } }));
+    const body = 'date,ticker,pnl\n2026-09-10,TSLA,195';
+    global.fetch = jest.fn(() => Promise.resolve(
+      new Response(body, { status: 200, headers: { 'Content-Type': 'text/csv' } }),
+    ));
+    await renderTrade();
+    fireEvent.click(screen.getByRole('tab', { name: 'Files' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview chart.png' }));
+    const dialog = await screen.findByRole('dialog', { name: 'chart.png' });
+    expect(await within(dialog).findByRole('img', { name: 'Preview of chart.png' })).toBeInTheDocument();
+    // The whole reason for a popup: it can be blown up past the panel's width.
+    const expand = within(dialog).getByRole('button', { name: 'Expand preview' });
+    fireEvent.click(expand);
+    expect(within(dialog).getByRole('button', { name: 'Shrink preview' })).toBeInTheDocument();
+    // Expanded has to cancel the stylesheet's clamps, or Expand would do nothing.
+    expect(dialog.style.maxWidth).toBe('none');
+    expect(dialog.style.maxHeight).toBe('none');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Shrink preview' }));
+    expect(within(dialog).getByRole('button', { name: 'Expand preview' })).toBeInTheDocument();
+    expect(dialog.style.maxWidth).toBe('920px');
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'chart.png' })).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview statement.pdf' }));
+    const pdfDialog = await screen.findByRole('dialog', { name: 'statement.pdf' });
+    // Scripts may run (Firefox's PDF viewer needs them) but the frame must never
+    // regain the journal's origin — no allow-same-origin, no allow-top-navigation.
+    const pdfFrame = within(pdfDialog).getByTitle('Preview of statement.pdf');
+    const tokens = (pdfFrame.getAttribute('sandbox') || '').split(/\s+/);
+    expect(tokens).not.toContain('allow-same-origin');
+    expect(tokens).not.toContain('allow-top-navigation');
+    fireEvent.click(within(pdfDialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'statement.pdf' })).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview fills.csv' }));
+    const textDialog = await screen.findByRole('dialog', { name: 'fills.csv' });
+    expect(await within(textDialog).findByText(/date,ticker,pnl/)).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/attachments/3/download'),
+      expect.objectContaining({ headers: { Range: expect.stringContaining('bytes=0-') } }),
+    );
+    fireEvent.click(within(textDialog).getByRole('button', { name: 'Close preview' }));
+
+    expect(screen.queryByRole('button', { name: 'Preview journal.xlsx' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Download journal.xlsx' })).toHaveAttribute(
+      'href', 'http://mocked.invalid/api/attachments/4/download',
+    );
+  });
+
+  test('a server refusal is shown verbatim instead of a dead-end sentence', async () => {
+    attachmentsApi.upload.mockImplementation(() => Promise.reject({
+      response: { status: 404, data: { detail: 'Trade not found' } },
+    }));
+    await renderTrade();
+
+    pasteFiles({ files: [new File(['x'], '', { type: 'image/png' })], items: [] });
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent('Trade not found');
+  });
+
+  test('a backend that never answers is named, not blamed on the file', async () => {
+    attachmentsApi.upload.mockImplementation(() => Promise.reject(new Error('Network Error')));
+    await renderTrade();
+
+    pasteFiles({ files: [new File(['x'], '', { type: 'image/png' })], items: [] });
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent(/backend did not answer/);
+    expect(screen.getByRole('alert')).not.toHaveTextContent('could not be attached');
+  });
+
+  test('ordinary text paste and typing in a field are left alone', async () => {
+    await renderTrade();
+
+    // No files: a text paste must fall through to whatever wanted it.
+    const textEvent = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(textEvent, 'clipboardData', { value: { files: [] } });
+    document.body.dispatchEvent(textEvent);
+    expect(textEvent.defaultPrevented).toBe(false);
+    expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'false');
+
+    // Focus in a field: never hijack, even with files attached.
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    const fieldEvent = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(fieldEvent, 'clipboardData', {
+      value: { files: [new File(['x'], 'note.png', { type: 'image/png' })] },
+    });
+    input.dispatchEvent(fieldEvent);
+    expect(fieldEvent.defaultPrevented).toBe(false);
+    expect(attachmentsApi.upload).not.toHaveBeenCalled();
+  });
+});
 
 test('header keeps every page, Settings, Import, Add Trade and a labeled Brain entry visible', async () => {
   await renderApp();
@@ -186,7 +415,7 @@ test('Reports keeps its tabs, adds Sources & Tags, and supports arrow-key naviga
   expect(within(tablist).getByRole('tab', { name: 'Setups & Strategy' })).toHaveAttribute('aria-selected', 'true');
 });
 
-test('Trade View opens Trade Details with all five tabs, back and previous/next', async () => {
+test('Trade View opens Trade Details with all six tabs, back and previous/next', async () => {
   await renderApp();
   fireEvent.click(within(nav()).getByRole('button', { name: 'Trade View' }));
   await waitFor(() => expect(tradesApi.list).toHaveBeenCalled());
@@ -196,7 +425,7 @@ test('Trade View opens Trade Details with all five tabs, back and previous/next'
 
   const tablist = await screen.findByRole('tablist', { name: 'Trade review sections' });
   const names = within(tablist).getAllByRole('tab').map(t => t.textContent.trim());
-  expect(names).toEqual(['Stats', 'Strategy', 'Tags', 'Executions', 'What If']);
+  expect(names).toEqual(['Stats', 'Strategy', 'Tags', 'Executions', 'Files', 'What If']);
   expect(screen.getByRole('button', { name: /Back to trades/ })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Previous trade/ })).toBeDisabled();
   expect(screen.getByRole('button', { name: /Next trade/ })).toBeEnabled();
