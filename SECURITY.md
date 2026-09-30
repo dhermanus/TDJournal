@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Trading Journal AI is an actively developed open-source project.
+TDJournal is an actively developed open-source project.
 
 Security fixes are generally applied to the latest released version and the current `main` branch.
 
@@ -14,7 +14,7 @@ Security fixes are generally applied to the latest released version and the curr
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Trading Journal AI, please **do not open a public GitHub issue**.
+If you discover a security vulnerability in TDJournal, please **do not open a public GitHub issue**.
 
 Instead, please use GitHub's **private vulnerability reporting** feature from the Security section of this repository.
 
@@ -30,7 +30,7 @@ Please avoid publicly disclosing the vulnerability until it has been reviewed an
 
 ## Security-Sensitive Areas
 
-Trading Journal AI works with potentially sensitive information including:
+TDJournal works with potentially sensitive information including:
 
 * Broker trade exports
 * Trading history and performance data
@@ -42,7 +42,7 @@ Reports involving exposure of this information, unauthorized access, credential 
 
 ## Data and Credentials
 
-Trading Journal AI is designed as a local-first application.
+TDJournal is designed as a local-first application.
 
 Users should never commit API keys, `.env` files, local databases, broker exports, or other private trading data to the repository.
 

@@ -1,4 +1,4 @@
-# Contributing to Trading Journal AI
+# Contributing to TDJournal
 
 Thanks for helping. Bug reports, broker samples, fixes and features are all welcome. This page
 covers how to set up, what to test, and what a pull request needs before it can be merged.

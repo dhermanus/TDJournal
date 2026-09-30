@@ -1,6 +1,6 @@
 # Code of Conduct
 
-Trading Journal AI is a small project built in the open. Everyone who takes part, in issues, pull
+TDJournal is a small project built in the open. Everyone who takes part, in issues, pull
 requests, discussions or anywhere else the project is represented, is expected to keep it a place
 where people can ask questions and disagree without being attacked.
 

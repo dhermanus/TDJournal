@@ -1,5 +1,5 @@
 /* ============================================================
-   Trading Journal: dark design system
+   TDJournal: dark design system
    Palette and scale from the 2026-09 dark redesign handoff.
    Semantic tokens first; legacy aliases below keep every existing
    component that still reads --bg-card, --purple, etc. working.

@@ -1,6 +1,6 @@
 {
-  "short_name": "Trading Journal AI",
-  "name": "Trading Journal AI",
+  "short_name": "TDJournal",
+  "name": "TDJournal",
   "icons": [],
   "start_url": ".",
   "display": "standalone",

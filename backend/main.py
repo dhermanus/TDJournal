@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Trading Journal AI API", lifespan=lifespan)
+app = FastAPI(title="TDJournal API", lifespan=lifespan)
 
 # This runs on your own machine, so any localhost port is accepted: when 3010 is
 # busy the dev server offers 3011, and the app should still work. FRONTEND_ORIGINS

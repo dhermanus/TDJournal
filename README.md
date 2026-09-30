@@ -1,4 +1,4 @@
-# Trading Journal AI
+# TDJournal
 
 [![CI](https://github.com/simonro/Trading-Journal-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/simonro/Trading-Journal-AI/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/simonro/Trading-Journal-AI)](https://github.com/simonro/Trading-Journal-AI/releases/latest)
@@ -25,9 +25,9 @@ synthetic demo seed, not anyone's real trades.
 
 ## Privacy and your data
 
-Trading Journal AI is designed as a **local-first application**.
+TDJournal is designed as a **local-first application**.
 
-Your trading journal database, imported broker data, notes, and uploaded files are stored locally on your computer. Trading Journal AI does not require an account and does not include telemetry or analytics that send your usage data back to the project. The backend listens on `localhost` only.
+Your trading journal database, imported broker data, notes, and uploaded files are stored locally on your computer. TDJournal does not require an account and does not include telemetry or analytics that send your usage data back to the project. The backend listens on `localhost` only.
 
 ### What stays local
 

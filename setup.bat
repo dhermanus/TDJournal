@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title Trading Journal AI Setup
+title TDJournal Setup
 cd /d "%~dp0"
 
-echo Trading Journal AI setup
+echo TDJournal setup
 echo.
 
 where python >nul 2>nul
