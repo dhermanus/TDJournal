@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+import schema
+
 load_dotenv()
 
 DB_PATH = os.getenv("DATABASE_PATH", "trading_journal.db")
@@ -17,139 +19,42 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db():
+    """Bring the journal to the current schema, then start it.
+
+    Order matters: Alembic decides what has been applied and takes its
+    pre-change snapshot first, then the idempotent pass in `schema` re-asserts
+    the invariants a version stamp cannot express (columns a pre-versioning
+    database may lack, a CHECK that needs rebuilding, an abandoned attachment
+    draft). Either layer alone would leave a gap; together they converge every
+    state the app has ever started from.
+    """
+    import dbmigration
+
+    backups_dir = os.getenv("BACKUP_DIR") or str(Path(DB_PATH).resolve().parent / "backups")
+    try:
+        dbmigration.run_migrations(DB_PATH, backups_dir=backups_dir)
+    except Exception as exc:  # noqa: BLE001 - any migration failure is fatal at startup
+        # Refuse to boot with a schema we cannot vouch for, rather than start
+        # and fail on the first query against a half-migrated table.
+        if isinstance(exc, dbmigration.MigrationError):
+            raise
+        raise dbmigration.MigrationError(
+            f"Could not apply schema migrations to {DB_PATH}: {exc}"
+        ) from exc
+
     conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('day_trading','swing_trading','investment')),
-            color TEXT NOT NULL DEFAULT '#6366f1',
-            broker TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL REFERENCES accounts(id),
-            trade_group TEXT NOT NULL,
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            instrument_type TEXT NOT NULL CHECK(instrument_type IN ('STOCK','OPTION','FUTURE')),
-            side TEXT NOT NULL CHECK(side IN ('LONG','SHORT')),
-            gross_pnl REAL,
-            net_pnl REAL,
-            commissions REAL DEFAULT 0,
-            executions TEXT NOT NULL DEFAULT '[]',
-            option_expiry TEXT,
-            option_strike REAL,
-            option_type TEXT CHECK(option_type IN ('CALL','PUT',NULL)),
-            source TEXT NOT NULL DEFAULT 'imported',
-            imported_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(trade_group, account_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS diary_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL REFERENCES accounts(id),
-            entry_date TEXT NOT NULL,
-            image_path TEXT,
-            raw_text TEXT,
-            ai_analysis TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS trade_analysis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_group TEXT NOT NULL UNIQUE,
-            ticker TEXT NOT NULL,
-            date TEXT NOT NULL,
-            strategy TEXT,
-            stop_loss REAL,
-            risk_per_trade REAL,
-            risk_reward REAL,
-            r_multiple REAL,
-            entry_reason TEXT,
-            exit_reason TEXT,
-            mistakes TEXT,
-            emotional_state TEXT,
-            notes TEXT,
-            ai_feedback TEXT,
-            match_confidence TEXT CHECK(match_confidence IN ('high','medium','low','ambiguous','unmatched','manual')),
-            match_notes TEXT,
-            diary_entry_id INTEGER REFERENCES diary_entries(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS trade_tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_group TEXT NOT NULL,
-            tag_type TEXT NOT NULL,
-            tag_value TEXT NOT NULL,
-            source TEXT NOT NULL CHECK(source IN ('ai','manual'))
-        );
-
-        CREATE TABLE IF NOT EXISTS daily_summaries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER REFERENCES accounts(id),
-            summary_date TEXT NOT NULL,
-            ai_content TEXT NOT NULL,
-            generated_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(summary_date, account_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL DEFAULT 0,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            UNIQUE(account_id, key)
-        );
-
-        -- The trader's playbook: named setups used to tag trades.
-        CREATE TABLE IF NOT EXISTS custom_setups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            side TEXT,                      -- LONG | SHORT | NULL (either)
-            notes TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_trades_account_date ON trades(account_id, date);
-        CREATE INDEX IF NOT EXISTS idx_trades_group ON trades(trade_group);
-        CREATE INDEX IF NOT EXISTS idx_analysis_group ON trade_analysis(trade_group);
-        CREATE INDEX IF NOT EXISTS idx_tags_group ON trade_tags(trade_group);
-    """)
-
-    conn.commit()
-
-    # Safe migrations — ignored if column already exists
-    for ddl in [
-        "ALTER TABLE trade_analysis ADD COLUMN target_price REAL",
-        "ALTER TABLE trade_analysis ADD COLUMN trade_rating INTEGER",
-        "ALTER TABLE trade_analysis ADD COLUMN idea_source TEXT",
-        # Playbook setup tag + optional execution-quality grade
-        "ALTER TABLE trades ADD COLUMN setup TEXT",           # playbook setup name, or NONE
-        "ALTER TABLE trades ADD COLUMN setup_grade TEXT",     # A++ | A+ | A | B | C | D | F
-        "ALTER TABLE trades ADD COLUMN setup_notes TEXT",     # JSON: free-form notes
-        "ALTER TABLE trades ADD COLUMN setup_features TEXT",  # JSON: market state at entry
-        # how the tag was set ('manual' in this demo; kept for compatibility)
-        "ALTER TABLE trades ADD COLUMN setup_source TEXT DEFAULT 'auto'",
-        # Trade-quality metrics measured from 1-min bars over the hold window.
-        # MFE = best unrealised gain reached, MAE = worst unrealised loss reached,
-        # exit_efficiency = realised / MFE, i.e. share of the move captured.
-        "ALTER TABLE trades ADD COLUMN mfe_pct REAL",
-        "ALTER TABLE trades ADD COLUMN mae_pct REAL",
-        "ALTER TABLE trades ADD COLUMN exit_efficiency REAL",
-    ]:
-        try:
-            conn.execute(ddl)
-            conn.commit()
-        except Exception:
-            pass
-
+    schema.ensure_schema(conn)
     conn.close()
+
+
+
+# Public names kept for existing tests and internal callers. The canonical
+# definitions now live in schema.py, which startup and Alembic both import, so
+# the application and its migrations cannot hold two versions of the schema.
+instrument_check_values = schema.instrument_check_values
+widen_instrument_type_check = schema.widen_instrument_type_check
+_instrument_check_probe = schema.instrument_check_probe
+_new_trades_sql = schema._new_trades_sql
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
