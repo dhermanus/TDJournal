@@ -60,10 +60,10 @@ const METRICS = [
     items: [
       {
         name: 'Time-of-Day P&L',
-        formula: 'Net P&L summed per 30-minute bucket (9:30 - 4:00)',
-        description: 'Aggregate profit and loss broken down by the 30-minute window when the trade was entered.',
-        why: 'Most intraday traders discover they lose money after a specific time. If your 1:00-2:30 PM bar is reliably red, that is a simple rule: stop trading after lunch. High-probability windows usually cluster in the first 90 minutes.',
-        target: 'Identify your highest and lowest P&L windows, then focus or avoid accordingly',
+        formula: 'Net P&L summed per 60-minute bucket, across a full 24 hours, on broker server time',
+        description: 'Aggregate profit and loss broken down by the hour the trade was entered, in the clock your broker ran on.',
+        why: 'FX trades around the clock, so a session that looks quiet in one hour can be where you give it all back in another. Most traders find a window that is reliably red — often the thin hours or the New York afternoon — and cutting it is a simpler rule than any indicator.',
+        target: 'Identify your highest and lowest P&L hours, then focus or avoid accordingly',
       },
       {
         name: 'Day-of-Week P&L',

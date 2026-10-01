@@ -2075,6 +2075,36 @@ def _mins_of(t):
         return None
 
 
+def _span_minutes(entry, exit_, trade_date):
+    """Elapsed entry→exit minutes, using leg dates where available.
+
+    Older manually-entered legs may have no date; in that case a backwards
+    clock is treated as crossing midnight once. The MT5 importer carries leg
+    dates, so multi-day positions use their actual elapsed span.
+    """
+    if not entry or not exit_:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        def stamp(leg, fallback_date):
+            d = (leg.get('date') or fallback_date or '').strip()
+            t = (leg.get('time') or '').strip()
+            if not d or not t:
+                return None
+            if len(t) == 5:
+                t += ':00'
+            return datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S")
+        start = stamp(entry, trade_date)
+        end = stamp(exit_, trade_date)
+        if start is None or end is None:
+            return None
+        if not exit_.get('date') and end < start:
+            end += timedelta(days=1)
+        return int((end - start).total_seconds() // 60)
+    except (ValueError, TypeError):
+        return None
+
+
 def _bucket_stats(rows, key_fn, label_fn=None):
     """Group rows by key_fn and compute the standard per-bucket stats.
 
@@ -2317,6 +2347,7 @@ def get_edge_report(
 ):
     sql = """
         SELECT t.trade_group, t.ticker, t.side, t.net_pnl, t.date, t.executions,
+               t.source,
                ta.r_multiple, ta.emotional_state, ta.mistakes
         FROM trades t
         LEFT JOIN trade_analysis ta ON t.trade_group = ta.trade_group
@@ -2377,16 +2408,37 @@ def get_edge_report(
         key=lambda x: -x["count"],
     )[:8]
 
-    # 30-min time buckets 9:30 -> 15:30
+    # Time-of-day buckets. FX trades around the clock, so the grid spans a full
+    # day; an hour outside a US cash session is a normal entry for a 24h market
+    # and must not be discarded. Buckets are 60 minutes because the dashboard
+    # labels this column "Hour" and renders every row it is given.
+    #
+    # The clock used is the broker server's: MT5 fills are stored as UTC, and a
+    # report against UTC shows hours nobody traded in. The conversion runs only
+    # for source='mt5' rows — every other importer already stores wall-clock
+    # time and shifting it again would move it by a whole day.
+    tz_name = _mt5_timezone(conn)
+    tz_note = None
+    if tz_name:
+        # Resolve the zone once, before any counting. An unusable name would
+        # otherwise fail inside the per-trade conversion and be swallowed by its
+        # handler, rendering a confident, entirely empty chart. Falling back to
+        # the stored clock keeps the rest of the report usable and names the
+        # problem, rather than failing every panel over one settings field.
+        try:
+            mt5_time.load_zone(tz_name)
+        except mt5_time.TimezoneError as exc:
+            tz_note = str(exc)
+            tz_name = ""
     BUCKETS: list[str] = []
-    t_min = 9 * 60 + 30
-    while t_min < 16 * 60:
+    for t_min in range(0, 24 * 60, 60):
         h, m = divmod(t_min, 60)
         BUCKETS.append(f"{h:02d}:{m:02d}")
-        t_min += 30
 
     bucket_pnl: dict[str, float] = {b: 0.0 for b in BUCKETS}
     bucket_counts: dict[str, int] = {b: 0 for b in BUCKETS}
+    entries_seen = 0
+    entries_unplaced = 0
 
     DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
     dow_pnl: dict[str, float] = {d: 0.0 for d in DOW_ORDER}
@@ -2415,24 +2467,39 @@ def get_edge_report(
         except Exception:
             execs = []
 
-        all_times = sorted([e.get("time", "") for e in execs if e.get("time")])
         entry_action = "BOT" if side == "LONG" else "SOLD"
-        entry_times = sorted([e.get("time", "") for e in execs if e.get("action") == entry_action and e.get("time")])
+        entry_exs = sorted(
+            [e for e in execs if e.get("action") == entry_action and e.get("time")],
+            # Position keys sort on (date, time): a position added to over two
+            # days has two entries whose clock times do not order them.
+            key=lambda e: (e.get("date") or date_str, e.get("time", "")),
+        )
+        entry_times = [e.get("time", "") for e in entry_exs]
 
         # Time-of-day bucket (entry time)
         if entry_times:
+            entries_seen += 1
             try:
-                parts = entry_times[0].split(":")
-                h, m = int(parts[0]), int(parts[1])
-                entry_mins = h * 60 + m
-                bucket_floor = ((entry_mins - 9 * 60 - 30) // 30) * 30 + 9 * 60 + 30
-                bh, bm = divmod(bucket_floor, 60)
-                bkey = f"{bh:02d}:{bm:02d}"
+                raw = entry_times[0]
+                clock = raw
+                if (trade.get("source") or "") == "mt5" and tz_name:
+                    # Stored time is UTC; report it on the broker's clock. The
+                    # date comes from the entry fill itself — an overnight
+                    # position can close on the far side of a DST change, and
+                    # the close date would then apply the wrong offset.
+                    clock = mt5_time.utc_to_server_hhmm(
+                        entry_exs[0].get("date") or date_str, raw, tz_name
+                    ) or raw
+                h, m = (int(x) for x in clock.split(":")[:2])
+                # Whole-hour floor: every minute in the hour shares one bucket.
+                bkey = f"{h:02d}:{0:02d}"
                 if bkey in bucket_pnl:
                     bucket_pnl[bkey] += pnl
                     bucket_counts[bkey] += 1
+                else:
+                    entries_unplaced += 1
             except Exception:
-                pass
+                entries_unplaced += 1
 
         # Day of week
         if date_str:
@@ -2446,20 +2513,23 @@ def get_edge_report(
             except Exception:
                 pass
 
-        # Hold time
-        if len(all_times) >= 2:
-            try:
-                def to_mins(t_str: str) -> float:
-                    p = t_str.split(":")
-                    return int(p[0]) * 60 + int(p[1]) + (int(p[2]) / 60 if len(p) == 3 else 0)
-                hold = to_mins(all_times[-1]) - to_mins(all_times[0])
-                if hold >= 0:
+        # Hold time. Subtracting clock times alone returns a negative number for
+        # any position held past midnight, and `if hold >= 0` then dropped it —
+        # measured on this journal, three trades (one of them held 21 days) were
+        # excluded from the winner/loser hold averages. Use leg dates.
+        if entry_exs:
+            exit_action = "SOLD" if side == "LONG" else "BOT"
+            exit_exs = sorted(
+                [e for e in execs if e.get("action") == exit_action and e.get("time")],
+                key=lambda e: (e.get("date") or date_str, e.get("time", "")),
+            )
+            if exit_exs:
+                hold = _span_minutes(entry_exs[0], exit_exs[-1], date_str)
+                if hold is not None and hold >= 0:
                     if pnl > 0:
                         winner_hold.append(hold)
                     elif pnl < 0:
                         loser_hold.append(hold)
-            except Exception:
-                pass
 
         # R-multiple distribution
         r = trade.get("r_multiple")
@@ -2528,6 +2598,18 @@ def get_edge_report(
 
     return {
         "time_of_day": time_of_day,
+        # Coverage for the chart above: an entry the grid could not place used to
+        # disappear silently, which is how 62% of an FX history went missing.
+        # Non-zero here means the report is under-counting and says so.
+        "time_of_day_coverage": {
+            "entries": entries_seen,
+            "placed": entries_seen - entries_unplaced,
+            "unplaced": entries_unplaced,
+            "timezone": tz_name if tz_name else "stored-as-is",
+            # Non-null only when the configured server zone was unusable and the
+            # chart is therefore showing stored (UTC) times instead.
+            "timezone_error": tz_note,
+        },
         "day_of_week": day_of_week,
         "r_multiple_dist": r_multiple_dist,
         "emotion_outcomes": emotion_outcomes,

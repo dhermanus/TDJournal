@@ -193,6 +193,33 @@ def convert_executions(executions: list[dict], tz_name: str) -> list[dict]:
     return executions
 
 
+def utc_to_server_hhmm(date_text: str, time_text: str, tz_name: str) -> str:
+    """Format a stored naive-UTC timestamp as broker-server `HH:MM`, or "".
+
+    The report buckets fills by the clock the broker ran on, which is the one a
+    journal entry was actually written against. The offset is looked up on the
+    fill's own date, so a summer fill and a winter fill land in different hours
+    without the caller knowing the server's daylight-saving rule.
+
+    Unparseable input returns "" rather than guessing: the caller drops the
+    trade from the chart and says so, instead of placing it at midnight.
+    """
+    zone = load_zone(tz_name)
+    try:
+        day = (date_text or "").strip()
+        clock = (time_text or "").strip()
+        if not day or not clock:
+            return ""
+        # Stored time may be HH:MM:SS or already HH:MM; accept both.
+        if len(clock) == 5:
+            clock = f"{clock}:00"
+        utc_naive = datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ""
+    server = utc_naive.replace(tzinfo=timezone.utc).astimezone(zone)
+    return server.strftime("%H:%M")
+
+
 def resolve_timezone(setting_value: str | None, env_value: str | None = None) -> str:
     """Pick the zone to use: database setting first, then environment, else blank."""
     for candidate in (setting_value, env_value):
