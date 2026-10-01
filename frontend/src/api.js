@@ -75,10 +75,6 @@ export const chartApi = {
     api.get(`/api/chart/${encodeURIComponent(ticker)}/${date}`, { params: { timeframe, days_back: daysBack } }),
 };
 
-export const insightsApi = {
-  get: (params) => api.get('/api/insights', { params }),
-};
-
 export const calendarApi = {
   get: (params) => api.get('/api/calendar', { params }),
 };

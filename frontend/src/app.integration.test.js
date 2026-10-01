@@ -88,7 +88,6 @@ jest.mock('./api', () => {
     importApi: withDefault({}),
     diaryApi: withDefault({ list: fn(() => ok([])) }),
     chartApi: withDefault({ get: fn(() => ok({ bars: [], warning: 'No chart data in tests' })) }),
-    insightsApi: withDefault({}),
     calendarApi: withDefault({ get: fn(() => ok({ days: [] })) }),
     brainApi: withDefault({}),
     dailySummaryApi: withDefault({ get: fn(() => ok({ trades: [] })) }),
