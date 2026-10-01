@@ -1,8 +1,6 @@
 import json
 import re
-from ai_analysis import get_client, response_text
-
-MODEL = "claude-opus-5"
+from ai_analysis import get_client, response_text, get_model
 
 DAILY_SUMMARY_PROMPT = """You are a professional trading coach producing an end-of-day performance review for a day trader.
 
@@ -188,7 +186,7 @@ Trades:
 Generate the daily coaching summary JSON."""
 
     response = client.messages.create(
-        model=MODEL,
+        model=get_model(),
         max_tokens=4096,
         system=DAILY_SUMMARY_PROMPT,
         messages=[{"role": "user", "content": user_content}],

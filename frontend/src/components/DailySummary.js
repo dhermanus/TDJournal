@@ -68,6 +68,7 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [summaryLoading, setSummaryLoading] = useState(true);
+  const [summaryError, setSummaryError] = useState(null);
   const [regenerating, setRegenerating] = useState(false);
   const [cbDismissed, setCbDismissed] = useState(false);
   const allTimeKpisRef = useRef(null);
@@ -121,8 +122,12 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
       if (accountId != null) sumParams.account_id = accountId;
       const sumRes = await dailySummaryApi.get(sumParams);
       setSummary(sumRes.data);
+      setSummaryError(null);
     } catch (e) {
+      // A refusal (feature turned off) and a failed call both have to be readable
+      // in the panel — the console is where this used to disappear.
       console.error('Failed to load summary', e);
+      setSummaryError(e.response?.data?.detail || 'Could not load the AI report.');
     } finally {
       setSummaryLoading(false);
     }
@@ -145,8 +150,10 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
       if (accountId != null) params.account_id = accountId;
       const res = await dailySummaryApi.get(params);
       setSummary(res.data);
+      setSummaryError(null);
     } catch (e) {
       console.error('Regenerate failed', e);
+      setSummaryError(e.response?.data?.detail || 'Could not regenerate the AI report.');
     } finally {
       setRegenerating(false);
       setSummaryLoading(false);
@@ -237,6 +244,11 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
           {/* Coaching first: you read the review, then the trades it is about */}
           <section className="card">
+            {summaryError && (
+              <div className="notice neg" role="alert" style={{ marginBottom: 14 }}>
+                {summaryError}
+              </div>
+            )}
             <Coaching summary={summary} loading={summaryLoading} onRegenerate={handleRegenerate} />
           </section>
 

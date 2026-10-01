@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Plus, Pencil, GitMerge, Trash2, Search } from 'lucide-react';
-import { libraryApi, mt5TimezoneApi, backupApi } from '../api';
+import { libraryApi, mt5TimezoneApi, backupApi, aiSettingsApi } from '../api';
 import { PageHeader } from './ui';
 
 const SECTIONS = [
   { id: 'strategy', label: 'Strategies' },
   { id: 'source', label: 'Sources' },
   { id: 'tag', label: 'Tags' },
+  { id: 'ai', label: 'AI' },
   { id: 'import', label: 'Import' },
   { id: 'backup', label: 'Backup' },
 ];
@@ -297,6 +298,156 @@ const normaliseMt5 = (data) => ({
 
 /** MT5 imports read broker-server wall time with no offset attached, so the
  *  zone has to be named here before a deal file means anything. */
+// ── AI settings: the model, and what is allowed to be sent ───────────────────
+//
+// Each row states what actually crosses the network, because the app's "no
+// telemetry" claim is true of the journal and not of an AI feature once it runs.
+// The switch means *nothing is sent*: the server refuses the endpoint before it
+// builds a prompt, so off is a refusal rather than a hidden button.
+function AiSettings() {
+  const [state, setState] = useState(null);
+  const [draftModel, setDraftModel] = useState('');
+  const [busy, setBusy] = useState(null);   // 'model' or a feature key
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await aiSettingsApi.get();
+      setState(res.data);
+      setDraftModel(res.data?.model || '');
+      setError(null);
+    } catch (e) {
+      setError(errText(e));
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (patch, who) => {
+    setBusy(who);
+    setError(null); setNotice(null);
+    try {
+      const res = await aiSettingsApi.put(patch);
+      setState(res.data);
+      if (patch.model != null) setNotice(`Saved ${res.data.model}.`);
+      else {
+        const name = Object.keys(patch.features)[0];
+        setNotice(`${res.data.feature_info[name].label} ${patch.features[name] ? 'on' : 'off'}.`);
+      }
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (!state && !error) return <div className="skeleton" style={{ height: 260 }} />;
+
+  const features = Object.keys(state.feature_info);
+  return (
+    <section className="card" aria-label="AI settings">
+      <div className="settings-head">
+        <div style={{ minWidth: 0 }}>
+          <h2 className="section-title">AI features</h2>
+          <div className="section-sub">
+            {state.notice} The journal itself never sends anything: only the
+            switches you leave on.
+          </div>
+        </div>
+      </div>
+
+      {!state.api_key_configured && (
+        <div className="notice" role="status" style={{ marginBottom: 14 }}>
+          No API key is set in <span className="num">backend/.env</span>. The features below
+          will report that when called.
+        </div>
+      )}
+
+      {notice && <div className="notice pos settings-notice" role="status">{notice}</div>}
+
+      <div className="settings-form" style={{ marginBottom: 4 }}>
+        <label>
+          <span className="field-label">Model</span>
+          <select
+            aria-label="AI model"
+            value={draftModel}
+            onChange={e => setDraftModel(e.target.value)}
+          >
+            {state.models.map(m => <option key={m} value={m}>{m}</option>)}
+            {draftModel && !state.models.includes(draftModel) && <option value={draftModel}>{draftModel}</option>}
+          </select>
+        </label>
+        <div className="settings-form-actions">
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={busy !== null || !draftModel.trim() || draftModel === state.model}
+            onClick={() => save({ model: draftModel.trim() }, 'model')}
+          >
+            {busy === 'model' ? 'Saving…' : 'Save model'}
+          </button>
+        </div>
+      </div>
+      <div className="section-sub" style={{ marginBottom: 18 }}>
+        Used by every feature below. A cheaper model trades some reasoning depth
+        for lower cost per call.
+      </div>
+
+      <table className="table">
+        <caption className="text-muted" style={{ captionSide: 'top', textAlign: 'left', fontSize: 13, paddingBottom: 8 }}>
+          Each row says what is sent when it is on. Turning a row off means that
+          feature refuses to run and sends nothing.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Feature</th>
+            <th scope="col">Sent when on</th>
+            <th scope="col" style={{ width: 90 }}>On</th>
+          </tr>
+        </thead>
+        <tbody>
+          {features.map(name => {
+            const info = state.feature_info[name];
+            const on = !!state.features[name];
+            const working = busy === name;
+            return (
+              <tr key={name}>
+                <th scope="row" style={{ fontWeight: 600 }}>{info.label}</th>
+                <td className="text-muted" style={{ fontSize: 13, fontWeight: 400 }}>
+                  {info.sends}
+                </td>
+                <td>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={on}
+                    aria-label={`${info.label} — ${on ? 'on' : 'off'}`}
+                    disabled={working}
+                    onClick={() => save({ features: { [name]: !on } }, name)}
+                    style={{
+                      width: 46, height: 24, borderRadius: 12, cursor: working ? 'wait' : 'pointer',
+                      border: `1px solid ${on ? 'var(--accent-line)' : 'var(--divider)'}`,
+                      background: on ? 'var(--accent-line)' : 'var(--surface-control)',
+                      color: on ? 'var(--surface-page)' : 'var(--text-secondary)',
+                      fontSize: 12, fontWeight: 700, lineHeight: '20px', padding: 0,
+                    }}
+                  >
+                    {on ? 'On' : 'Off'}
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {error && <div className="notice neg" role="alert" style={{ marginTop: 10 }}>{error}</div>}
+    </section>
+  );
+}
+
+
 function ImportSettings() {
   const [state, setState] = useState(null);
   const [draft, setDraft] = useState('');
@@ -696,6 +847,7 @@ export default function Settings() {
             ))}
           </div>
         )}
+        {section === 'ai' && <AiSettings />}
         {section === 'import' && <ImportSettings />}
         {section === 'backup' && <BackupSettings />}
       </div>

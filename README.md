@@ -9,7 +9,8 @@ round-trip trades, tracks the numbers that matter (win rate, profit factor, expe
 MFE/MAE, exit efficiency), and, if you want it to, uses Claude to read your trading diary and grade
 your days on process.
 
-- **Your data stays on your computer.** One SQLite file, no account, no telemetry.
+- **Local-first.** One SQLite file, no account, no telemetry — unless you switch on an AI feature,
+  which sends only what that feature needs to the Anthropic API.
 - **The numbers are not AI.** Trade grouping, P&L, fees and statistics are plain code with tests.
   AI is an optional coaching layer on top.
 - **Stocks, options and futures**, with partial fills, scale-ins and shorts grouped automatically.
@@ -44,7 +45,7 @@ Some features use third-party APIs and are completely optional.
 
 **Claude / Anthropic**
 
-When you use AI analysis or the Brain assistant, the information required to answer your request may be sent to Anthropic's API. This can include trade information, journal context, or images you explicitly ask the AI to analyze.
+When you use an AI feature, the information required to answer that request may be sent to the configured Anthropic-compatible API endpoint. This can include trade information or journal context, and, for diary analysis, the file you upload. Each feature can be turned off separately in Settings → AI; a disabled feature refuses the request before building its context or saving an uploaded file. The settings page explains what each feature sends. Your API key and local database remain on your computer.
 
 The core journal, trade reconstruction, P&L calculations, reports, and statistics do not require Claude.
 

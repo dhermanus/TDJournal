@@ -11,7 +11,16 @@ from brain_tools import TOOL_SCHEMAS, run_tool
 
 load_dotenv()
 
-MODEL = "claude-opus-5"
+def get_model() -> str:
+    """The model selected in Settings → AI.
+
+    Kept as a function rather than a module constant because Settings can change
+    it at runtime and six call sites across two modules read it. The import sits
+    inside the function so ai_settings does not have to import this module back.
+    """
+    from ai_settings import get_model as _get_model
+    return _get_model()
+
 
 DIARY_SYSTEM_PROMPT = """You are an expert trading coach analyzing a trader's handwritten or typed diary entry.
 
@@ -249,7 +258,7 @@ Please analyze this trading diary screenshot. For each trade you find mentioned:
 Return only the JSON object."""
 
     response = client.messages.create(
-        model=MODEL,
+        model=get_model(),
         max_tokens=DIARY_MAX_TOKENS,
         system=DIARY_SYSTEM_PROMPT,
         messages=[
@@ -294,7 +303,7 @@ def analyze_diary_text(text_content: str, entry_date: str, trades_context: list[
     trades_context_str = '\n'.join(context_lines) if context_lines else "No trades found for this date."
 
     response = client.messages.create(
-        model=MODEL,
+        model=get_model(),
         max_tokens=DIARY_MAX_TOKENS,
         system=DIARY_SYSTEM_PROMPT,
         messages=[{
@@ -500,7 +509,7 @@ def generate_insights(trades_summary: dict) -> str:
     summary_text = json.dumps(trades_summary, indent=2)
 
     response = client.messages.create(
-        model=MODEL,
+        model=get_model(),
         max_tokens=2048,
         messages=[
             {
@@ -671,7 +680,7 @@ def generate_weekly_summary(week_context: dict) -> dict:
     )
 
     response = client.messages.create(
-        model=MODEL,
+        model=get_model(),
         max_tokens=2048,
         system=WEEKLY_SUMMARY_PROMPT,
         messages=[{"role": "user", "content": user_content}],
@@ -711,7 +720,7 @@ def generate_brain_response(messages: list[dict], context: str, conn=None, accou
     tools = TOOL_SCHEMAS if conn is not None else None
     for _ in range(BRAIN_MAX_TOOL_ROUNDS):
         response = client.messages.create(
-            model=MODEL,
+            model=get_model(),
             max_tokens=2048,
             system=BRAIN_SYSTEM_PROMPT,
             messages=claude_messages,
@@ -740,7 +749,7 @@ def generate_brain_response(messages: list[dict], context: str, conn=None, accou
     # Looped too many times: answer from the standing summary rather than
     # hammering the endpoint.
     final = response_text(client.messages.create(
-        model=MODEL, max_tokens=2048, system=BRAIN_SYSTEM_PROMPT,
+        model=get_model(), max_tokens=2048, system=BRAIN_SYSTEM_PROMPT,
         messages=claude_messages + [{"role": "user",
             "content": "Stop calling tools. Answer from what you already have."}]))
     return final or "I couldn't finish that answer after several data lookups. Please try a narrower question."

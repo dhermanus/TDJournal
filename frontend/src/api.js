@@ -116,6 +116,14 @@ export const mt5TimezoneApi = {
   put: (timezone) => api.put('/api/mt5/timezone', { timezone }),
 };
 
+// Settings > AI: which model runs, and which AI features are allowed to send.
+// `features` are booleans; `feature_info` carries label + the "sends" copy, kept
+// separate so the two payload shapes do not collide when rendering.
+export const aiSettingsApi = {
+  get: () => api.get('/api/ai-settings'),
+  put: (patch) => api.put('/api/ai-settings', patch),
+};
+
 export const backupApi = {
   getDestination: () => api.get('/api/backup/destination'),
   setDestination: (folder) => api.put('/api/backup/destination', { folder }),

@@ -35,6 +35,7 @@ from ai_analysis import (
     generate_weekly_summary,
 )
 from daily_summary import build_daily_context, generate_daily_summary
+import ai_settings
 from library import router as library_router, init_library_tables, apply_aliases, library_names
 import instruments
 import mt5_time
@@ -51,10 +52,27 @@ async def lifespan(app: FastAPI):
     _conn = get_db()
     try:
         init_library_tables(_conn)
+        # The selected model is read at request time by the AI call sites, which
+        # have no connection, so it is loaded once here (and again on save).
+        ai_settings.set_model(ai_settings.load_config(_conn)["model"])
     finally:
         _conn.close()
     Path(UPLOAD_DIR).mkdir(exist_ok=True)
     yield
+
+
+def require_feature(conn: sqlite3.Connection, feature: str):
+    """Refuse an AI request whose feature is switched off, before anything is built.
+
+    The check sits first in every AI endpoint, ahead of context construction,
+    because a disabled toggle has to mean "this feature sends nothing" — not
+    "build the prompt and drop the answer".
+    """
+    if not ai_settings.is_enabled(conn, feature):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{ai_settings.FEATURES[feature]['label']} is turned off in Settings → AI. "
+                   "Nothing was sent.")
 
 
 app = FastAPI(title="TDJournal API", lifespan=lifespan)
@@ -255,6 +273,53 @@ def put_mt5_timezone(
     )
     conn.commit()
     return get_mt5_timezone(conn=conn)
+
+
+# ── AI settings ───────────────────────────────────────────────────────────────
+#
+# "Your data stays local" is true of the app and false of the AI features the
+# moment they run, so the switches and the disclosure live next to each other.
+
+class AiSettingsBody(BaseModel):
+    model: str | None = None
+    features: dict[str, bool] | None = None
+
+
+def _ai_settings_response() -> dict:
+    cfg = ai_settings.load_config(get_db())
+    from urllib.parse import urlparse
+    configured = os.getenv("ANTHROPIC_BASE_URL", "").strip()
+    if configured:
+        host = urlparse(configured).netloc or configured
+        destination = f"the endpoint set in backend/.env ({host})"
+    else:
+        destination = "Anthropic's API (api.anthropic.com)"
+    return {
+        "model": cfg["model"],
+        "models": list(ai_settings.KNOWN_MODELS),
+        "features": cfg["features"],
+        # label + sends are kept separate so the UI can render them without the
+        # payload shapes colliding (booleans here, prose there).
+        "feature_info": {name: dict(meta) for name, meta in ai_settings.FEATURES.items()},
+        "api_key_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "sends_to": destination,
+        "notice": f"Turning a feature on sends the data listed beside it to {destination}. "
+                  "Turning it off means that feature sends nothing.",
+    }
+
+
+@app.get("/api/ai-settings")
+def get_ai_settings():
+    return _ai_settings_response()
+
+
+@app.put("/api/ai-settings")
+def put_ai_settings(body: AiSettingsBody, conn: sqlite3.Connection = Depends(get_connection)):
+    try:
+        ai_settings.save_config(conn, model=body.model, features=body.features)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _ai_settings_response()
 
 
 # ── Accounts ───────────────────────────────────────────────────────────────────
@@ -1545,6 +1610,10 @@ async def upload_diary(
     file: UploadFile = File(...),
     conn: sqlite3.Connection = Depends(get_connection),
 ):
+    # Checked before the file is read or written: with diary analysis off, the
+    # endpoint's whole purpose (upload → Claude → entry) must not happen at all,
+    # so the notice can honestly say nothing was saved and nothing was sent.
+    require_feature(conn, "diary")
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_DIARY_EXTENSIONS:
         raise ValueError(f"File must be one of {ALLOWED_DIARY_EXTENSIONS}")
@@ -2696,6 +2765,7 @@ def get_insights(
     account_id: int | None = Query(None),
     conn: sqlite3.Connection = Depends(get_connection),
 ):
+    require_feature(conn, "insights")
     # Reuse KPI data as input to insights. Pass explicit None for the date
     # filters: called as a plain function, get_kpis would otherwise receive
     # truthy Query() defaults and bind them into SQL.
@@ -2717,6 +2787,7 @@ def get_weekly_summary(
     force: bool = Query(False),
     conn: sqlite3.Connection = Depends(get_connection),
 ):
+    require_feature(conn, "weekly")
     from datetime import timedelta
     d = datetime.strptime(date, "%Y-%m-%d")
     week_start = d - timedelta(days=d.weekday())
@@ -2798,6 +2869,7 @@ def get_daily_summary(
     force: bool = Query(False),
     conn: sqlite3.Connection = Depends(get_connection),
 ):
+    require_feature(conn, "daily_summary")
     # Check cache first
     if not force:
         row = conn.execute(
@@ -2856,6 +2928,7 @@ async def brain_chat(
 
     if not messages:
         raise HTTPException(status_code=400, detail="No messages provided")
+    require_feature(conn, "brain")
 
     try:
         context = build_brain_context(conn, account_id)

@@ -253,7 +253,8 @@ export default function Import({ accounts, accountId }) {
         setDiaryError('Diary saved, but AI analysis failed: ' + res.data.analysis_error);
       }
     } catch (e) {
-      setDiaryError(e.response?.data?.error || e.message);
+      // A refusal (feature off) carries `detail`; an import failure carries `error`.
+      setDiaryError(e.response?.data?.detail || e.response?.data?.error || e.message);
     } finally {
       setAnalyzing(false);
     }
@@ -495,7 +496,12 @@ export default function Import({ accounts, accountId }) {
           )}
 
           <div style={{ marginTop: 16, fontSize: 13, color: 'var(--text-secondary)' }}>
-            Claude AI will read your handwritten or typed notes and extract strategy, stops, R-multiples, emotional state, and more.
+            Claude AI will read your handwritten or typed notes and extract strategy, stops,
+            R-multiples, emotional state, and more.
+            <span style={{ display: 'block', marginTop: 6 }}>
+              Sending the file and that date&apos;s trades to the AI API in Settings → AI.
+              {' '}Turning Diary Analysis off makes this button refuse instead.
+            </span>
           </div>
         </section>
       </div>
