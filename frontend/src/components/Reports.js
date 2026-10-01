@@ -412,8 +412,18 @@ export default function Reports({ accountId }) {
               <Section title="By Day of Week">
                 <Breakdown view={view} rows={data.by_day_of_week} labelHead="Day" />
               </Section>
-              <Section title="By Time of Day" hint="Bucketed on first entry.">
-                <Breakdown view={view} rows={data.by_session} labelHead="Entry window" />
+              <Section title="By Time of Day" hint="Hourly buckets on broker server time (MT5), across all 24 hours.">
+                <Breakdown view={view} rows={data.by_session} labelHead="Entry hour" />
+                {data.time_of_day_coverage && (
+                  <div style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 8 }} role="status">
+                    {data.time_of_day_coverage.placed} of {data.time_of_day_coverage.entries} entries placed
+                    {data.time_of_day_coverage.timezone_error
+                      ? ` · Timezone issue: ${data.time_of_day_coverage.timezone_error}`
+                      : data.time_of_day_coverage.unplaced
+                        ? ` · ${data.time_of_day_coverage.unplaced} could not be bucketed`
+                        : ''}
+                  </div>
+                )}
               </Section>
               <Section title="By Hold Time" hint="First entry to last exit. Short holds are usually stop-outs and chases.">
                 <Breakdown view={view} rows={data.by_hold_time} labelHead="Hold" />

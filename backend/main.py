@@ -2060,8 +2060,7 @@ def get_yearly_kpis(
 _DOW_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 _SETUP_LABEL_MAP = {'NONE': 'No setup'}
 _HOLD_ORDER = ['0-5 min', '5-15 min', '15-30 min', '30-60 min', '1-2 hrs', '2+ hrs']
-_SESSION_ORDER = ['09:30-09:45', '09:45-10:30', '10:30-11:00',
-                  '11:00-13:30', '13:30-15:30', '15:30-16:00']
+_HOUR_ORDER = [f"{h:02d}:00" for h in range(24)]
 
 
 def _mins_of(t):
@@ -2154,6 +2153,26 @@ def _ordered(buckets, order):
     return sorted(buckets, key=lambda b: idx.get(b['key'], 999))
 
 
+def _zero_bucket(key):
+    """An hour nobody traded in. Shown rather than omitted, so the table spans
+    the same 24 hours as the dashboard chart and an empty hour reads as 'none'
+    instead of disappearing."""
+    return {
+        "key": str(key), "label": str(key), "trades": 0,
+        "net_pnl": 0, "avg_pnl": 0, "median_pnl": 0, "win_rate": 0,
+        "wins": 0, "losses": 0, "avg_win": 0, "avg_loss": 0,
+        "profit_factor": None, "big_losses": 0,
+        "exit_efficiency": None, "avg_mae": None,
+    }
+
+
+def _fill_order(buckets, order):
+    """Every key in `order` present, in order; keys outside it keep their place."""
+    by_key = {b['key']: b for b in buckets}
+    out = [_zero_bucket(k) if k not in by_key else by_key[k] for k in order]
+    return out + [b for b in buckets if b['key'] not in set(order)]
+
+
 @app.get("/api/reports")
 def get_reports(
     account_id: int | None = Query(None),
@@ -2167,12 +2186,12 @@ def get_reports(
     sql = """
         SELECT t.id, t.trade_group, t.ticker, t.side, t.date, t.net_pnl,
                t.instrument_type, t.executions, t.setup, t.setup_grade,
-               t.mfe_pct, t.mae_pct, t.exit_efficiency,
+               t.source, t.mfe_pct, t.mae_pct, t.exit_efficiency,
                ta.strategy, ta.r_multiple, ta.emotional_state, ta.mistakes,
                ta.idea_source
         FROM trades t
         LEFT JOIN trade_analysis ta ON t.trade_group = ta.trade_group
-        WHERE t.net_pnl IS NOT NULL AND t.net_pnl <> 0
+        WHERE t.net_pnl IS NOT NULL
     """
     params: list = []
     if account_id is not None:
@@ -2188,7 +2207,24 @@ def get_reports(
 
     raw = [dict(r) for r in conn.execute(sql, params).fetchall()]
     if not raw:
-        return {"has_data": False}
+        return {"has_data": False, "time_of_day_coverage": {
+            "entries": 0, "placed": 0, "unplaced": 0,
+            "timezone": _mt5_timezone(conn), "timezone_error": None,
+        }}
+
+    # Resolve timezone once. An invalid setting falls back to the stored clock,
+    # and is exposed in coverage instead of silently removing entries.
+    configured_tz = _mt5_timezone(conn)
+    tz_name = configured_tz
+    tz_error = None
+    if tz_name:
+        try:
+            mt5_time.load_zone(tz_name)
+        except mt5_time.TimezoneError as exc:
+            tz_error = str(exc)
+            tz_name = ""
+    coverage_entries = 0
+    coverage_placed = 0
 
     # Derive entry time, hold duration and exit count once per trade.
     for r in raw:
@@ -2198,12 +2234,37 @@ def get_reports(
             ex = []
         ea = 'BOT' if r['side'] == 'LONG' else 'SOLD'
         xa = 'SOLD' if r['side'] == 'LONG' else 'BOT'
-        ent = sorted([e for e in ex if e.get('action') == ea], key=lambda e: e.get('time', ''))
-        xit = sorted([e for e in ex if e.get('action') == xa], key=lambda e: e.get('time', ''))
+        ent = sorted(
+            [e for e in ex if e.get('action') == ea],
+            key=lambda e: (e.get('date') or r.get('date', ''), e.get('time', '')),
+        )
+        xit = sorted(
+            [e for e in ex if e.get('action') == xa],
+            key=lambda e: (e.get('date') or r.get('date', ''), e.get('time', '')),
+        )
         t_in = _mins_of(ent[0].get('time')) if ent else None
-        t_out = _mins_of(xit[-1].get('time')) if xit else None
+        if ent:
+            coverage_entries += 1
+            if (r.get('source') or '') == 'mt5' and tz_name:
+                # Unconvertible input falls back to the stored clock rather than
+                # dropping the trade — same rule as the dashboard chart.
+                clock = mt5_time.utc_to_server_hhmm(
+                    ent[0].get('date') or r.get('date', ''), ent[0].get('time', ''), tz_name
+                ) or ent[0].get('time', '')
+                t_in = _mins_of(clock)
+            # Placed means 'will land in a bucket', counted here so coverage can
+            # never claim a trade the table does not show.
+            if t_in is not None and 0 <= t_in < 24 * 60:
+                coverage_placed += 1
+            else:
+                t_in = None
         r['entry_min'] = t_in
-        r['hold_min'] = (t_out - t_in) if (t_in is not None and t_out is not None) else None
+        # Hold is first entry to last exit, in wall-clock minutes. Dates are part
+        # of it: an FX position opened 22:00 and closed 06:00 the next morning
+        # held for 8 hours, not -16. Doing this from clock time alone made every
+        # overnight hold negative, and a negative hold was dropped from the
+        # hold-time table entirely.
+        r['hold_min'] = _span_minutes(ent[0] if ent else None, xit[-1] if xit else None, r.get('date'))
         r['n_exits'] = len({e.get('time') for e in xit}) if xit else 0
         try:
             r['dow'] = _dt.strptime(r['date'], '%Y-%m-%d').weekday()
@@ -2227,20 +2288,13 @@ def get_reports(
         return '2+ hrs'
 
     def session_bucket(r):
+        """Whole-hour floor on the entry clock. A 24h market has no sessions
+        worth hard-coding, and every minute has exactly one home, so nothing
+        can be caught by an 'everything else' fallback."""
         t = r['entry_min']
-        if t is None:
+        if t is None or t < 0 or t >= 24 * 60:
             return None
-        if t < 9 * 60 + 45:
-            return '09:30-09:45'
-        if t < 10 * 60 + 30:
-            return '09:45-10:30'
-        if t < 11 * 60:
-            return '10:30-11:00'
-        if t < 13 * 60 + 30:
-            return '11:00-13:30'
-        if t < 15 * 60 + 30:
-            return '13:30-15:30'
-        return '15:30-16:00'
+        return f"{t // 60:02d}:00"
 
     def management_bucket(r):
         if r['n_exits'] > 1:
@@ -2264,15 +2318,19 @@ def get_reports(
         equity.append({"date": d, "pnl": round(p, 2),
                        "cumulative": round(cum, 2), "drawdown": round(dd, 2)})
 
-    # Streaks over trades in chronological order.
+    # Streaks over trades in chronological order. A scratch (net P&L exactly 0)
+    # ends either run without counting as a loss — it was not a winning trade,
+    # but it was not a losing one either.
     cur = best_win = worst_loss = 0
     for r in raw:
         if r['net_pnl'] > 0:
             cur = cur + 1 if cur > 0 else 1
             best_win = max(best_win, cur)
-        else:
+        elif r['net_pnl'] < 0:
             cur = cur - 1 if cur < 0 else -1
             worst_loss = min(worst_loss, cur)
+        else:
+            cur = 0
 
     # Tags per trade (strategy and source tags mirror their fields, so they are left out).
     # A trade with several tags counts once under each of them.
@@ -2300,6 +2358,17 @@ def get_reports(
     return {
         "has_data": True,
         "trade_count": len(raw),
+        # Guards the timing breakdown: `placed + unplaced` must equal `entries`.
+        # Without this, an entry that fails to bucket disappears from the chart
+        # with no trace — which is exactly how the old US-session grid hid 62%
+        # of an FX journal.
+        "time_of_day_coverage": {
+            "entries": coverage_entries,
+            "placed": coverage_placed,
+            "unplaced": coverage_entries - coverage_placed,
+            "timezone": tz_name if tz_name else "stored-as-is",
+            "timezone_error": tz_error,
+        },
         "equity_curve": equity,
         "summary": {
             "net_pnl": round(sum(r['net_pnl'] for r in raw), 2),
@@ -2319,7 +2388,7 @@ def get_reports(
         "by_day_of_week": _ordered(
             _bucket_stats(raw, lambda r: r['dow'], lambda k: _DOW_NAMES[int(k)]),
             [str(i) for i in range(7)]),
-        "by_session": _ordered(_bucket_stats(raw, session_bucket), _SESSION_ORDER),
+        "by_session": _fill_order(_bucket_stats(raw, session_bucket), _HOUR_ORDER),
         "by_hold_time": _ordered(_bucket_stats(raw, hold_bucket), _HOLD_ORDER),
         "by_month": sorted(_bucket_stats(raw, lambda r: r['date'][:7]),
                            key=lambda b: b['key']),
