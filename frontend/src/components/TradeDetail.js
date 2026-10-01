@@ -7,6 +7,7 @@ import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
 import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
 import { fillTs } from './chartTime';
+import { parseExecs, computeStats, entryLeg, fmtHold, qtyLabel, legTime } from './tradeMetrics';
 
 const fmt$ = (v) => {
   if (v == null) return '—';
@@ -19,12 +20,6 @@ const fmtSigned$ = (v) => {
   const n = Number(v);
   return (n >= 0 ? '+$' : '-$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 };
-
-// The per-trade maths lives in tradeMetrics so it can be tested without
-// dragging the whole component graph into a test run. What it changed:
-// fills ordered by (date, time) rather than by the clock, and a return reported
-// only when price × quantity is really dollars.
-import { parseExecs, computeStats, fmtHold, qtyLabel, legTime } from './tradeMetrics';
 
 // ── Stat row helper ────────────────────────────────────────────────────────────
 
@@ -203,17 +198,17 @@ const EMPTY_EXEC = { action: 'BOT', qty: '', price: '0.00', commission: '0.00', 
 
 // ── Main TradeDetail component ────────────────────────────────────────────────
 
-// Order a trade's fills by (date, time), same rule as computeStats: clock order
-// alone reverses a position whose legs span two days. All the sidebar's entries
-// are shown for one session date, but their legs need not share it.
+// The sidebar shows one session's trades. Its open time comes from entryLeg
+// (the same call the list view makes) so the two lists cannot disagree; only
+// the close end is picked here, since exit legs carry no side filter.
 function getDayTradeTime(t, which) {
-  const execs = (Array.isArray(t.executions) ? t.executions : []).filter(e => e && e.time);
+  if (which === 'open') return entryLeg(t)?.time?.slice(0, 5) || null;
+  const execs = parseExecs(t).filter(e => e && e.time);
   if (!execs.length) return null;
   const ordered = [...execs].sort(
     (a, b) => (fillTs(a, t.date, 1) || 0) - (fillTs(b, t.date, 1) || 0)
   );
-  const pick = which === 'open' ? ordered[0] : ordered[ordered.length - 1];
-  return pick.time.slice(0, 5);
+  return ordered[ordered.length - 1].time.slice(0, 5);
 }
 
 function DaySidebar({ currentTrade, onOpenDetail }) {

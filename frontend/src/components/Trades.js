@@ -4,6 +4,7 @@ import { tradesApi } from '../api';
 import TradeRow from './TradeRow';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue } from './ui';
 import { INSTRUMENT_TYPES, INSTRUMENT_LABELS } from '../instruments';
+import { entryLeg } from './tradeMetrics';
 
 const PAGE_SIZE = 25;
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -14,9 +15,10 @@ const fmtDay = (d) => {
 };
 
 function getOpenTime(trade) {
-  const execs = trade.executions || [];
-  if (!execs.length) return '';
-  return [...execs].sort((a, b) => (a.time || '').localeCompare(b.time || ''))[0].time || '';
+  // Ordered by (date, time), not by the clock: the list is sorted by
+  // date + open time, so a position opened 13:42 the day before its close date
+  // must read 13:42 — the clock-only sort showed its exit hour instead.
+  return entryLeg(trade)?.time || '';
 }
 
 function SortIcon({ col, sortCol, sortDir }) {

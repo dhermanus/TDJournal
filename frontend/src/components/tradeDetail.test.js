@@ -14,7 +14,7 @@
 //      dollar ratio when one price unit is worth one currency unit per
 //      quantity. On FX that denominator is price × lots, so a −$2.59 trade
 //      measured −22,266% and 1,027 of 1,346 trades exceeded ±1000%.
-import { computeStats, fmtHold, qtyLabel, QTY_LABELS, legTime } from './tradeMetrics';
+import { computeStats, fmtHold, qtyLabel, QTY_LABELS, legTime, entryLeg, openTime } from './tradeMetrics';
 
 const leg = (date, time, action, qty = 0.01, price = 1.16) =>
   ({ date, time, action, qty, price });
@@ -78,14 +78,28 @@ describe('legs are ordered by date and time, not by the clock', () => {
     expect(s.openTime).toBe('09:28:00');
   });
 
-  test('a leg with no time cannot be ordered, and is not reported as one', () => {
+  test('an entry leg with no time is unknown, not the exit leg', () => {
     const s = computeStats(fxTrade([
       { date: '2026-07-01', action: 'BOT', qty: 0.01, price: 1.16 },
       leg('2026-07-01', '10:00:00', 'SOLD'),
     ]));
     expect(s.closeTime).toBe('10:00:00');
-    expect(s.openTime).toBe('10:00:00'); // falls back to the only stamp we have
-    expect(Number.isFinite(s.holdMinutes)).toBe(true);
+    // Falling back to the exit fill made the entry and exit the same leg, which
+    // reported an instant hold on a position whose start we do not know.
+    expect(s.openTime).toBeNull();
+    expect(s.holdMinutes).toBeNull();
+    expect(s.isClosed).toBe(true);
+    expect(s.totalQty).toBe(0.01);   // the entry fill is still counted
+    expect(s.avgEntry).toBe(1.16);
+  });
+
+  test('a trade with no entry legs at all still shows its earliest fill', () => {
+    // Only exit-side legs: nothing directional to prefer, so the earliest fill
+    // is the best guess rather than nothing at all.
+    const s = computeStats(fxTrade([leg('2026-07-01', '10:00:00', 'SOLD')]));
+    expect(s.openTime).toBe('10:00:00');
+    expect(s.holdMinutes).toBeNull();   // no exit leg, so still no span
+    expect(s.isClosed).toBe(true);
   });
 
   test('a SHORT trade takes the SOLD leg as its entry', () => {
@@ -161,6 +175,51 @@ describe('a leg that happened on another day carries its date', () => {
   test('a fill with no leg date still renders its clock time', () => {
     expect(legTime(null, '09:22:09', '2025-09-02')).toBe('09:22');
     expect(legTime('2025-09-02', null, '2025-09-02')).toBeNull();
+  });
+});
+
+describe('the Trade View cell shows the opening leg, not the earliest clock', () => {
+  test('a multi-day position reads 13:42, the hour it actually opened', () => {
+    const t = fxTrade([
+      leg('2025-08-12', '13:42:24', 'BOT'),
+      leg('2025-09-02', '09:22:09', 'SOLD'),
+    ]);
+    // Clock order reported 09:22 — the exit hour — and this column also feeds
+    // the list's secondary sort.
+    expect(openTime(t)).toBe('13:42:24');
+    expect(entryLeg(t).date).toBe('2025-08-12');
+    expect(openTime(t)).toBe(computeStats(t).openTime);
+  });
+
+  test('an entry leg with no time renders an empty cell, not the exit time', () => {
+    const t = fxTrade([
+      { date: '2026-07-01', action: 'BOT', qty: 0.01, price: 1.16 },
+      leg('2026-07-01', '10:00:00', 'SOLD'),
+    ]);
+    expect(entryLeg(t)).toBeNull();
+    expect(openTime(t)).toBe('');
+  });
+
+  test('a trade with no fills at all yields nothing', () => {
+    expect(entryLeg({ date: '2026-07-01', side: 'LONG', executions: [] })).toBeNull();
+    expect(openTime({ date: '2026-07-01', side: 'LONG', executions: [] })).toBe('');
+    expect(openTime({ date: '2026-07-01', side: 'LONG' })).toBe('');
+  });
+
+  test('a SHORT trade reads its SOLD leg', () => {
+    const t = { ...fxTrade([
+      leg('2026-07-01', '14:00:00', 'SOLD'),
+      leg('2026-07-01', '13:00:00', 'BOT'),   // clock-earlier fill
+    ]), side: 'SHORT' };
+    expect(openTime(t)).toBe('14:00:00');
+    expect(openTime(t)).toBe(computeStats(t).openTime);
+  });
+
+  test('a JSON-encoded execution string behaves like an array', () => {
+    const t = { date: '2026-07-01', side: 'LONG',
+      executions: JSON.stringify([leg('2026-07-01', '11:00:00', 'BOT'),
+                                  leg('2026-07-01', '12:00:00', 'SOLD')]) };
+    expect(openTime(t)).toBe('11:00:00');
   });
 });
 

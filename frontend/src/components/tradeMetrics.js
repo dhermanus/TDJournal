@@ -17,6 +17,44 @@ export function parseExecs(trade) {
   try { return JSON.parse(raw); } catch { return []; }
 }
 
+/** One fill's position in time, in the trade's own stored clock. */
+const stamp = (trade) => (f) => (f ? fillTs(f, trade.date, 1) : NaN);
+
+/** Fills ordered by (date, time); entries without a usable stamp drop out. */
+const timed = (trade, fills) => fills
+  .map(f => ({ f, t: stamp(trade)(f) }))
+  .filter(x => Number.isFinite(x.t))
+  .sort((a, b) => a.t - b.t);
+
+/**
+ * The fill that opened the position, in (date, time) order.
+ *
+ * Shared by the Trade View list, the detail header and the session sidebar so
+ * they cannot disagree: the list once sorted clock times alone and showed
+ * "09:22" for a position that actually opened at 13:42 the previous day.
+ *
+ * Falls back to the earliest fill only when the record has no entry leg; if an
+ * entry leg exists but its timestamp is missing, returns null so we do not
+ * invent a zero-minute hold.
+ */
+export function entryLeg(trade) {
+  const execs = parseExecs(trade);
+  const side = trade.side;
+  const entryFills = execs.filter(e => side === 'LONG' ? e.action === 'BOT' : e.action === 'SOLD');
+  if (entryFills.length) {
+    // Entry legs are known but unstamped: say nothing rather than echo the
+    // exit leg back as the entry (see computeStats — that fabricated a
+    // zero-minute hold).
+    return timed(trade, entryFills)[0]?.f || null;
+  }
+  return timed(trade, execs)[0]?.f || null;
+}
+
+/** `HH:MM` of the opening leg, or '' — what the Trade View cell shows. */
+export function openTime(trade) {
+  return entryLeg(trade)?.time || '';
+}
+
 export function computeStats(trade) {
   const execs = parseExecs(trade);
   const side = trade.side;
@@ -47,29 +85,28 @@ export function computeStats(trade) {
   // closed 09:22 on 2 Sep was sorting as 09:22 → 13:42: swapped ends, and 21
   // days read as 4h 20m. The chart has ordered fills this way all along; the
   // stats are catching up.
-  const stamp = (f) => (f ? fillTs(f, trade.date, 1) : NaN);
-  const byTime = (fills) => fills
-    .map(f => ({ f, t: stamp(f) }))
-    .filter(x => Number.isFinite(x.t))
-    .sort((a, b) => a.t - b.t);
-  const timed = byTime(execs);
-  const firstEntry = (byTime(entryFills)[0] || timed[0])?.f;
-  const lastExit = byTime(exitFills).slice(-1)[0]?.f;
+  const firstEntry = entryLeg(trade);
+  const lastExit = timed(trade, exitFills).slice(-1)[0]?.f;
 
-  const openTime  = firstEntry?.time || null;
+  // Named legOpenTime, not openTime: the exported openTime() above would
+  // otherwise be shadowed by this local.
+  const legOpenTime  = firstEntry?.time || null;
   const openDate  = firstEntry?.date || trade.date || null;
   const closeTime = lastExit?.time || null;
   const closeDate = lastExit?.date || trade.date || null;
 
   let holdMinutes = null;
-  if (Number.isFinite(stamp(firstEntry)) && Number.isFinite(stamp(lastExit))) {
-    holdMinutes = Math.max(0, Math.round((stamp(lastExit) - stamp(firstEntry)) / 60));
+  const s = stamp(trade);
+  const spanned = entryFills.length && exitFills.length
+    && Number.isFinite(s(firstEntry)) && Number.isFinite(s(lastExit));
+  if (spanned) {
+    holdMinutes = Math.max(0, Math.round((s(lastExit) - s(firstEntry)) / 60));
   }
 
   const isClosed = exitFills.length > 0;
   const isWin = (trade.net_pnl || 0) > 0;
 
-  return { avgEntry, avgExit, totalQty, adjustedCost, netRoi, openTime, openDate, closeTime, closeDate, holdMinutes, isClosed, isWin, entryFills, exitFills };
+  return { avgEntry, avgExit, totalQty, adjustedCost, netRoi, openTime: legOpenTime, openDate, closeTime, closeDate, holdMinutes, isClosed, isWin, entryFills, exitFills };
 }
 
 /** A hold read in minutes: minutes, then hours, then days — never negative. */
