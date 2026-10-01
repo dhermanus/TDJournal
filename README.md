@@ -88,7 +88,10 @@ Trade reconstruction, P&L, commissions, statistics, and other core trading calcu
 - **Day Review**: the session drawn as one picture, running P&L from the open to the close with every
   trade marked where you entered it, plus an AI coaching report graded on process rather than P&L.
   Each trade's grade carries the reason it was given
-- **Brain**: a chat that answers questions against your full trading history
+- **Brain**: a chat that answers questions about your trading history. It reads your journal
+  through read-only query tools — totals, individual trades, breakdowns by strategy, symbol,
+  weekday or day, and your diary — so every figure it quotes is computed by the app, not by
+  the model
 - **Settings**: the name library. Strategies, sources and tags in one place, with rename, merge and
   delete. Merging rewrites every trade that used the old name and remembers it, so the next diary
   analysis that produces the duplicate saves it under the name you kept

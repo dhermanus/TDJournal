@@ -2859,7 +2859,7 @@ async def brain_chat(
 
     try:
         context = build_brain_context(conn, account_id)
-        response_text = generate_brain_response(messages, context)
+        response_text = generate_brain_response(messages, context, conn, account_id)
         return {"response": response_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
