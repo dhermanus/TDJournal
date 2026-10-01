@@ -4,6 +4,7 @@ import {
   ResponsiveContainer, Cell, PieChart, Pie
 } from 'recharts';
 import { kpisApi, insightsApi } from '../api';
+import { usageLine } from './aiUsage';
 import { instrumentColor } from '../instruments';
 import { Sparkles } from 'lucide-react';
 
@@ -13,6 +14,8 @@ export default function Strategies({ accountId }) {
   const [kpis, setKpis] = useState(null);
   const [loading, setLoading] = useState(true);
   const [insights, setInsights] = useState('');
+  // What the last generate cost, in the same words as Day Review and Brain.
+  const [insightsUsage, setInsightsUsage] = useState(null);
   const [loadingInsights, setLoadingInsights] = useState(false);
   const [insightsError, setInsightsError] = useState(null);
 
@@ -33,6 +36,7 @@ export default function Strategies({ accountId }) {
       if (accountId != null) params.account_id = accountId;
       const res = await insightsApi.get(params);
       setInsights(res.data.insights);
+      setInsightsUsage(res.data.ai_usage || null);
     } catch (e) {
       setInsightsError(e.response?.data?.detail || e.message);
     } finally {
@@ -174,6 +178,11 @@ export default function Strategies({ accountId }) {
 
         {insightsError && (
           <div style={{ color: 'var(--red)', fontSize: 13 }}>{insightsError}</div>
+        )}
+        {usageLine(insightsUsage) && (
+          <div style={{ color: 'var(--text-secondary)', fontSize: 12, marginBottom: 10 }} role="status" aria-label="AI token usage">
+            {usageLine(insightsUsage)}
+          </div>
         )}
 
         {insights ? (

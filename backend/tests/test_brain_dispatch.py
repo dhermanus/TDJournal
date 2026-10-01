@@ -101,7 +101,23 @@ def test_the_tools_are_offered_on_the_wire(monkeypatch, conn):
     _, fake = ask(monkeypatch, conn, [Turn("end_turn", ["hi"])])
     offered = fake.calls[0].get("tools")
     assert offered is not None, "tools must be sent or the model cannot ask"
-    assert offered == TOOL_SCHEMAS
+    # Same schemas, but the last one carries cache_control so the tool block is
+    # a cacheable prefix — Brain resends it on every round of its tool loop.
+    bare = [{k: v for k, v in tool.items() if k != "cache_control"} for tool in offered]
+    assert bare == TOOL_SCHEMAS, "the cache annotation must not alter the schemas"
+    assert "cache_control" not in TOOL_SCHEMAS[-1], "the shared list must stay unmutated"
+    for tool in offered[:-1]:
+        assert "cache_control" not in tool, "only the break at the end of the prefix"
+    assert offered[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_the_system_prompt_is_a_cacheable_block(monkeypatch, conn):
+    _, fake = ask(monkeypatch, conn, [Turn("end_turn", ["hi"])])
+    system = fake.calls[0].get("system")
+    assert isinstance(system, list), "block form so cache_control can ride along"
+    assert system[0]["type"] == "text"
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[0]["text"] == ai_analysis.BRAIN_SYSTEM_PROMPT, "caching must not change the words"
 
 
 def test_a_tool_round_feeds_the_result_back_then_answers(monkeypatch, conn):

@@ -36,6 +36,8 @@ from ai_analysis import (
 )
 from daily_summary import build_daily_context, generate_daily_summary
 from diary_matches import analyse_confidence, queued_for_review
+from daily_cache import daily_input_fingerprint, date_range_fingerprint
+from ai_usage import last_usage, forget_usage, friendly_error
 import ai_settings
 from library import router as library_router, init_library_tables, apply_aliases, library_names
 import instruments
@@ -74,6 +76,33 @@ def require_feature(conn: sqlite3.Connection, feature: str):
             status_code=403,
             detail=f"{ai_settings.FEATURES[feature]['label']} is turned off in Settings → AI. "
                    "Nothing was sent.")
+
+
+def _ai_usage_payload(usage: dict | None, reason: str | None = None) -> dict:
+    """What an AI action spent, in the shape every AI endpoint returns.
+
+    `spent` is false for a cache hit or a refusal, so the UI never attributes a
+    cost to a request that was not made. `estimated_cost_usd` is a published-rate
+    estimate rather than an invoice — the configured endpoint bills its own
+    rates — and `cache_*` tokens read as 0 because the proxy in front of this
+    deployment strips those fields instead of reporting them.
+    """
+    if not usage:
+        return {"spent": False, "reason": reason or "no request was made"}
+    payload = {
+        "spent": True,
+        "model": usage.get("model"),
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+        "estimated_cost_usd": usage.get("estimated_cost_usd", 0.0),
+        "estimate": True,
+        "finished_at": usage.get("finished_at"),
+    }
+    if reason:
+        payload["reason"] = reason
+    return payload
 
 
 app = FastAPI(title="TDJournal API", lifespan=lifespan)
@@ -2827,6 +2856,7 @@ def get_insights(
     conn: sqlite3.Connection = Depends(get_connection),
 ):
     require_feature(conn, "insights")
+    forget_usage()
     # Reuse KPI data as input to insights. Pass explicit None for the date
     # filters: called as a plain function, get_kpis would otherwise receive
     # truthy Query() defaults and bind them into SQL.
@@ -2834,9 +2864,10 @@ def get_insights(
 
     try:
         insights_text = generate_insights(kpis)
-        return {"insights": insights_text}
+        return {"insights": insights_text, "ai_usage": _ai_usage_payload(last_usage())}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status, detail = friendly_error(e)
+        raise HTTPException(status_code=status, detail=detail)
 
 
 # ── Weekly Summary ─────────────────────────────────────────────────────────────
@@ -2849,6 +2880,7 @@ def get_weekly_summary(
     conn: sqlite3.Connection = Depends(get_connection),
 ):
     require_feature(conn, "weekly")
+    forget_usage()
     from datetime import timedelta
     d = datetime.strptime(date, "%Y-%m-%d")
     week_start = d - timedelta(days=d.weekday())
@@ -2857,17 +2889,40 @@ def get_weekly_summary(
     week_from = week_start.strftime("%Y-%m-%d")
     week_to = week_end.strftime("%Y-%m-%d")
     cache_key = f"weekly_{week_label}"
+    # Same staleness rule as a Day Review: the week is only reusable while its
+    # trades and diary notes are the ones it was written from.
+    week_hash = date_range_fingerprint(conn, week_from, week_to, account_id)
+    stale_reason = None
 
-    if not force and account_id is not None:
+    if not force:
         cached = conn.execute(
-            "SELECT ai_content FROM daily_summaries WHERE summary_date = ? AND account_id = ?",
-            (cache_key, account_id),
+            "SELECT ai_content, input_hash FROM daily_summaries WHERE summary_date = ? AND (account_id = ? OR (account_id IS NULL AND ? IS NULL))",
+            (cache_key, account_id, account_id),
         ).fetchone()
         if cached and cached[0]:
-            try:
-                return json.loads(cached[0])
-            except Exception:
-                pass
+            stored_hash = cached[1]
+            if stored_hash and stored_hash == week_hash:
+                try:
+                    payload = json.loads(cached[0])
+                    payload["cached"] = True
+                    payload["ai_usage"] = {"spent": False, "reason": "cached"}
+                    return payload
+                except Exception:
+                    stale_reason = "the stored summary could not be read"
+            elif stored_hash is None:
+                stale_reason = "cached before staleness tracking existed"
+            else:
+                stale_reason = "trades or diary notes changed since this was written"
+
+    sql = "SELECT trade_group FROM trades WHERE date BETWEEN ? AND ?"
+    params = [week_from, week_to]
+    if account_id is not None:
+        sql += " AND account_id = ?"
+        params.append(account_id)
+    has_trades = conn.execute(sql + " LIMIT 1", params).fetchone()
+    if not has_trades:
+        return {"error": "No trades found for this week", "week_label": week_label,
+                "week_from": week_from, "week_to": week_to}
 
     sql = """
         SELECT t.trade_group, t.ticker, t.side, t.net_pnl, t.date,
@@ -2900,24 +2955,32 @@ def get_weekly_summary(
     try:
         result = generate_weekly_summary(week_context)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status, detail = friendly_error(e)
+        raise HTTPException(status_code=status, detail=detail)
 
     result["week_label"] = week_label
     result["week_from"] = week_from
     result["week_to"] = week_to
+    result["ai_usage"] = _ai_usage_payload(last_usage(), stale_reason)
 
-    if account_id is not None:
-        try:
-            conn.execute(
-                """INSERT OR REPLACE INTO daily_summaries
-                   (account_id, summary_date, ai_content, generated_at)
-                   VALUES (?, ?, ?, ?)""",
-                (account_id, cache_key, json.dumps(result), datetime.now().isoformat()),
-            )
-            conn.commit()
-        except Exception:
-            pass
+    # Always written, account or not: a summary left un-keyed was unreachable by
+    # the next read, so every weekly summary was regenerated from scratch. Delete
+    # first — SQLite treats NULLs as distinct in a UNIQUE index, so `REPLACE`
+    # would stack a second row instead of overwriting when account_id is NULL.
+    conn.execute(
+        "DELETE FROM daily_summaries WHERE summary_date = ? AND account_id IS ?",
+        (cache_key, account_id),
+    )
+    conn.execute(
+        """INSERT INTO daily_summaries
+           (account_id, summary_date, ai_content, generated_at, input_hash)
+           VALUES (?, ?, ?, ?, ?)""",
+        (account_id, cache_key, json.dumps(result), datetime.now().isoformat(), week_hash),
+    )
+    conn.commit()
 
+    result["cached"] = False
+    result["regenerated_reason"] = stale_reason
     return result
 
 
@@ -2931,21 +2994,34 @@ def get_daily_summary(
     conn: sqlite3.Connection = Depends(get_connection),
 ):
     require_feature(conn, "daily_summary")
-    # Check cache first
+    # A cached review is only usable if it still describes this day: the hash
+    # covers the day's trades and its diary entry, so editing either marks it
+    # stale. `force` stays as a manual override for "regenerate anyway".
+    forget_usage()
+    current_hash = daily_input_fingerprint(conn, date, account_id)
+    stale_reason = None
+
     if not force:
         row = conn.execute(
-            "SELECT ai_content, generated_at FROM daily_summaries WHERE summary_date = ? AND (account_id = ? OR (account_id IS NULL AND ? IS NULL))",
+            "SELECT ai_content, generated_at, input_hash FROM daily_summaries WHERE summary_date = ? AND (account_id = ? OR (account_id IS NULL AND ? IS NULL))",
             (date, account_id, account_id)
         ).fetchone()
         if row:
-            try:
-                content = json.loads(row['ai_content'])
-                content['date'] = date
-                content['cached'] = True
-                content['generated_at'] = row['generated_at']
-                return content
-            except Exception:
-                pass
+            stored_hash = row['input_hash']
+            if stored_hash and stored_hash != current_hash:
+                stale_reason = "trades or diary notes changed since this was written"
+            elif stored_hash is None:
+                stale_reason = "cached before staleness tracking existed"
+            else:
+                try:
+                    content = json.loads(row['ai_content'])
+                    content['date'] = date
+                    content['cached'] = True
+                    content['generated_at'] = row['generated_at']
+                    content['ai_usage'] = {"spent": False, "reason": "cached"}
+                    return content
+                except Exception:
+                    stale_reason = "the stored review could not be read"
 
     try:
         context = build_daily_context(conn, date, account_id)
@@ -2961,16 +3037,28 @@ def get_daily_summary(
                 "unavailable": True,
                 "narrative": "Add ANTHROPIC_API_KEY to backend/.env to generate a review for this day.",
             }
-        raise HTTPException(status_code=500, detail=str(e))
+        status, detail = friendly_error(e)
+        raise HTTPException(status_code=status, detail=detail)
 
+    summary['ai_usage'] = _ai_usage_payload(last_usage(), stale_reason)
+    # Delete-then-insert: REPLACE does not match a NULL account_id in SQLite's
+    # UNIQUE index, so a review with no account would have stacked a new row on
+    # every regeneration instead of replacing the old one.
     conn.execute(
-        "INSERT OR REPLACE INTO daily_summaries (summary_date, account_id, ai_content, generated_at) VALUES (?, ?, ?, datetime('now'))",
-        (date, account_id, json.dumps(summary))
+        "DELETE FROM daily_summaries WHERE summary_date = ? AND account_id IS ?",
+        (date, account_id),
+    )
+    conn.execute(
+        """INSERT INTO daily_summaries
+           (summary_date, account_id, ai_content, generated_at, input_hash)
+           VALUES (?, ?, ?, datetime('now'), ?)""",
+        (date, account_id, json.dumps(summary), current_hash)
     )
     conn.commit()
 
     summary['date'] = date
     summary['cached'] = False
+    summary['regenerated_reason'] = stale_reason
     return summary
 
 
@@ -2990,10 +3078,12 @@ async def brain_chat(
     if not messages:
         raise HTTPException(status_code=400, detail="No messages provided")
     require_feature(conn, "brain")
+    forget_usage()
 
     try:
         context = build_brain_context(conn, account_id)
         response_text = generate_brain_response(messages, context, conn, account_id)
-        return {"response": response_text}
+        return {"response": response_text, "ai_usage": _ai_usage_payload(last_usage())}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status, detail = friendly_error(e)
+        raise HTTPException(status_code=status, detail=detail)

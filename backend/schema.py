@@ -203,6 +203,9 @@ COLUMN_ADDITIONS = [
     "ALTER TABLE trade_analysis ADD COLUMN target_price REAL",
     "ALTER TABLE trade_analysis ADD COLUMN trade_rating INTEGER",
     "ALTER TABLE trade_analysis ADD COLUMN idea_source TEXT",
+    # What the cached Day Review was written from, so a trade or diary edit
+    # marks it stale instead of leaving coaching text about a day that changed.
+    "ALTER TABLE daily_summaries ADD COLUMN input_hash TEXT",
     # Playbook setup tag + optional execution-quality grade
     "ALTER TABLE trades ADD COLUMN setup TEXT",           # playbook setup name, or NONE
     "ALTER TABLE trades ADD COLUMN setup_grade TEXT",     # A++ | A+ | A | B | C | D | F

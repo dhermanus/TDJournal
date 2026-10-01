@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { tradesApi, kpisApi, diaryApi, dailySummaryApi } from '../api';
 import { PageHeader, PanelHead } from './ui';
+import { usageLine } from './aiUsage';
 import { DayCurve, DayMeasures, Coaching, DayTrades } from '../v3/ReviewParts';
 import {
   BarChart, Bar, XAxis, YAxis, ReferenceLine,
@@ -250,6 +251,17 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
               </div>
             )}
             <Coaching summary={summary} loading={summaryLoading} onRegenerate={handleRegenerate} />
+            {usageLine(summary?.ai_usage) && (
+              <div style={{
+                marginTop: 12,
+                paddingTop: 10,
+                borderTop: '1px solid var(--divider-soft)',
+                color: 'var(--text-secondary)',
+                fontSize: 12,
+              }} role="status" aria-label="AI token usage">
+                {usageLine(summary.ai_usage)}
+              </div>
+            )}
           </section>
 
           {/* The trades */}

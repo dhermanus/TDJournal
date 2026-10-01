@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { X, Send, Brain as BrainIcon } from 'lucide-react';
 import { brainApi } from '../api';
+import { usageLine } from './aiUsage';
 
 // ── Markdown renderer ─────────────────────────────────────────────────────────
 
@@ -69,6 +70,9 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  // What the most recent answer cost, shown under the composer: a per-turn
+  // figure rather than a running total, so it always describes what is on screen.
+  const [lastUsage, setLastUsage] = useState(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const launcherRef = useRef(null);
@@ -97,6 +101,7 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
     try {
       const res = await brainApi.chat(nextMessages, accountId);
       setMessages(prev => [...prev, { role: 'assistant', content: res.data.response }]);
+      setLastUsage(res.data.ai_usage || null);
     } catch (e) {
       setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${e.response?.data?.detail || e.message}` }]);
     } finally {
@@ -170,6 +175,15 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
           </div>
 
           {/* Input */}
+          {usageLine(lastUsage) && (
+            <div style={{
+              padding: '8px 14px 0',
+              color: 'var(--text-secondary)',
+              fontSize: 11.5,
+            }} role="status" aria-label="AI token usage">
+              {usageLine(lastUsage)}
+            </div>
+          )}
           <div style={{ padding: '10px 14px 14px', borderTop: '1px solid var(--divider)', display: 'flex', gap: 8 }}>
             <input
               ref={inputRef}

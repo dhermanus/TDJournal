@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from brain_tools import TOOL_SCHEMAS, run_tool
 from diary_matches import DIARY_ANALYSIS_SCHEMA, analyse_confidence
+from ai_usage import create_client
 
 load_dotenv()
 
@@ -163,7 +164,9 @@ def get_client() -> anthropic.Anthropic:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key or api_key == "your_anthropic_api_key_here":
         raise ValueError("ANTHROPIC_API_KEY is not set in .env file")
-    return anthropic.Anthropic(api_key=api_key)
+    # create_client, not anthropic.Anthropic: this is where the retry policy is
+    # set and where each call's token usage is recorded for the ai_usage block.
+    return create_client(api_key=api_key)
 
 
 
@@ -568,6 +571,33 @@ it and keep answering with the tools."""
 BRAIN_MAX_TOOL_ROUNDS = 4
 
 
+def cached_system(prompt: str) -> list[dict]:
+    """System prompt as a block carrying cache_control.
+
+    Brain resends the same system prompt on every round of its tool loop and on
+    every turn of the conversation, so it is the stable prefix worth marking.
+    Returned as a block list rather than a plain string, which the API accepts
+    either way. Caching is a hint: if the endpoint or selected model does not
+    support prompt caching, it can ignore the annotation without changing the
+    answer.
+    """
+    return [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}]
+
+
+def cached_tools(schemas: list[dict]) -> list[dict]:
+    """Tool definitions with cache_control on the last one.
+
+    Only the final entry is marked: the API caches a prefix, and the break has to
+    land at the end of it. The schema list itself is copied so the shared
+    TOOL_SCHEMAS is never mutated — brain_tools' own tests read it.
+    """
+    if not schemas:
+        return []
+    tools = [dict(tool) for tool in schemas]
+    tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    return tools
+
+
 def build_brain_context(conn, account_id) -> str:
     """The standing overview Brain opens with — deliberately small.
 
@@ -727,12 +757,13 @@ def generate_brain_response(messages: list[dict], context: str, conn=None, accou
             context_injected = True
         claude_messages.append({"role": role, "content": content})
 
-    tools = TOOL_SCHEMAS if conn is not None else None
+    tools = cached_tools(TOOL_SCHEMAS) if conn is not None else None
+    system = cached_system(BRAIN_SYSTEM_PROMPT)
     for _ in range(BRAIN_MAX_TOOL_ROUNDS):
         response = client.messages.create(
             model=get_model(),
             max_tokens=2048,
-            system=BRAIN_SYSTEM_PROMPT,
+            system=system,
             messages=claude_messages,
             **({"tools": tools} if tools else {}),
         )
@@ -759,7 +790,7 @@ def generate_brain_response(messages: list[dict], context: str, conn=None, accou
     # Looped too many times: answer from the standing summary rather than
     # hammering the endpoint.
     final = response_text(client.messages.create(
-        model=get_model(), max_tokens=2048, system=BRAIN_SYSTEM_PROMPT,
+        model=get_model(), max_tokens=2048, system=system,
         messages=claude_messages + [{"role": "user",
             "content": "Stop calling tools. Answer from what you already have."}]))
     return final or "I couldn't finish that answer after several data lookups. Please try a narrower question."
