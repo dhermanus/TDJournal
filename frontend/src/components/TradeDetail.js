@@ -6,6 +6,7 @@ import useFilePaste from '../useFilePaste';
 import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
 import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
+import { fillTs } from './chartTime';
 
 const fmt$ = (v) => {
   if (v == null) return '—';
@@ -19,53 +20,11 @@ const fmtSigned$ = (v) => {
   return (n >= 0 ? '+$' : '-$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 };
 
-function parseExecs(trade) {
-  const raw = trade.executions;
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-  try { return JSON.parse(raw); } catch { return []; }
-}
-
-function computeStats(trade) {
-  const execs = parseExecs(trade);
-  const side = trade.side;
-  const entryFills = execs.filter(e => side === 'LONG' ? e.action === 'BOT' : e.action === 'SOLD');
-  const exitFills  = execs.filter(e => side === 'LONG' ? e.action === 'SOLD' : e.action === 'BOT');
-
-  const avgPrice = (fills) => {
-    const qty = fills.reduce((s, f) => s + (f.qty || 0), 0);
-    if (!qty) return null;
-    return fills.reduce((s, f) => s + (f.qty || 0) * (f.price || 0), 0) / qty;
-  };
-
-  const avgEntry = avgPrice(entryFills);
-  const avgExit  = avgPrice(exitFills);
-  const totalQty = entryFills.reduce((s, f) => s + (f.qty || 0), 0);
-  const adjustedCost = avgEntry ? avgEntry * totalQty : null;
-  const netRoi = adjustedCost ? (trade.net_pnl / adjustedCost * 100) : null;
-
-  const sortedTimes = [...execs].map(e => e.time).filter(Boolean).sort();
-  const openTime  = sortedTimes[0];
-  const closeTime = sortedTimes[sortedTimes.length - 1];
-
-  let holdMinutes = null;
-  if (openTime && closeTime && exitFills.length > 0) {
-    const [oh, om] = openTime.split(':').map(Number);
-    const [ch, cm] = closeTime.split(':').map(Number);
-    holdMinutes = (ch * 60 + cm) - (oh * 60 + om);
-  }
-
-  const fmtHold = (m) => {
-    if (m == null) return '—';
-    if (m < 60) return `${m}m`;
-    return `${Math.floor(m / 60)}h ${m % 60}m`;
-  };
-
-  const isClosed = exitFills.length > 0;
-  const isWin = (trade.net_pnl || 0) > 0;
-
-  return { avgEntry, avgExit, totalQty, adjustedCost, netRoi, openTime, closeTime, holdMinutes, fmtHold, isClosed, isWin, entryFills, exitFills };
-}
+// The per-trade maths lives in tradeMetrics so it can be tested without
+// dragging the whole component graph into a test run. What it changed:
+// fills ordered by (date, time) rather than by the clock, and a return reported
+// only when price × quantity is really dollars.
+import { parseExecs, computeStats, fmtHold, qtyLabel, legTime } from './tradeMetrics';
 
 // ── Stat row helper ────────────────────────────────────────────────────────────
 
@@ -244,10 +203,17 @@ const EMPTY_EXEC = { action: 'BOT', qty: '', price: '0.00', commission: '0.00', 
 
 // ── Main TradeDetail component ────────────────────────────────────────────────
 
+// Order a trade's fills by (date, time), same rule as computeStats: clock order
+// alone reverses a position whose legs span two days. All the sidebar's entries
+// are shown for one session date, but their legs need not share it.
 function getDayTradeTime(t, which) {
-  const execs = Array.isArray(t.executions) ? t.executions : [];
-  const times = execs.map(e => e.time).filter(Boolean).sort();
-  return which === 'open' ? times[0]?.slice(0, 5) : times[times.length - 1]?.slice(0, 5);
+  const execs = (Array.isArray(t.executions) ? t.executions : []).filter(e => e && e.time);
+  if (!execs.length) return null;
+  const ordered = [...execs].sort(
+    (a, b) => (fillTs(a, t.date, 1) || 0) - (fillTs(b, t.date, 1) || 0)
+  );
+  const pick = which === 'open' ? ordered[0] : ordered[ordered.length - 1];
+  return pick.time.slice(0, 5);
 }
 
 function DaySidebar({ currentTrade, onOpenDetail }) {
@@ -550,9 +516,9 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           <span className="num">{trade.date}</span>
           {' / '}{instrumentLabel(trade.instrument_type)}
           {' / '}{trade.side === 'LONG' ? 'Long' : trade.side === 'SHORT' ? 'Short' : trade.side}
-          {stats.openTime && <> · Opened <span className="num">{stats.openTime.slice(0, 5)}</span></>}
-          {stats.closeTime && stats.isClosed && <> · Closed <span className="num">{stats.closeTime.slice(0, 5)}</span></>}
-          {stats.holdMinutes != null && <> · Held <span className="num">{stats.fmtHold(stats.holdMinutes)}</span></>}
+          {stats.openTime && <> · Opened <span className="num">{legTime(stats.openDate, stats.openTime, trade.date)}</span></>}
+          {stats.closeTime && stats.isClosed && <> · Closed <span className="num">{legTime(stats.closeDate, stats.closeTime, trade.date)}</span></>}
+          {stats.holdMinutes != null && <> · Held <span className="num">{fmtHold(stats.holdMinutes)}</span></>}
         </>}
         actions={tradeNavList.length > 1 ? <>
           <button
@@ -687,16 +653,16 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 </div>
 
                 <StatRow label="Side" value={trade.side} />
-                <StatRow label="Stocks traded" value={stats.totalQty || '—'} />
+                <StatRow label={qtyLabel(trade.instrument_type)} value={stats.totalQty || '—'} />
                 <StatRow label="Commissions & Fees" value={trade.commissions ? fmt$(trade.commissions) : '—'} />
-                <StatRow label="Net ROI" value={stats.netRoi != null ? `${stats.netRoi >= 0 ? '+' : ''}${stats.netRoi.toFixed(2)}%` : '—'} valueColor={stats.netRoi != null ? (stats.netRoi >= 0 ? 'var(--green)' : 'var(--red)') : undefined} />
+                {stats.netRoi != null && <StatRow label="Net ROI" value={`${stats.netRoi >= 0 ? '+' : ''}${stats.netRoi.toFixed(2)}%`} valueColor={stats.netRoi >= 0 ? 'var(--green)' : 'var(--red)'} />}
                 <StatRow label="Gross P&L" value={trade.gross_pnl != null ? fmt$(trade.gross_pnl) : '—'} valueColor={trade.gross_pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
-                <StatRow label="Adjusted Cost" value={stats.adjustedCost ? fmt$(stats.adjustedCost) : '—'} />
+                {stats.adjustedCost != null && <StatRow label="Adjusted Cost" value={fmt$(stats.adjustedCost)} />}
                 <StatRow label="Average Entry" value={stats.avgEntry ? `$${stats.avgEntry.toFixed(2)}` : '—'} />
                 <StatRow label="Average Exit" value={stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : '—'} />
-                <StatRow label="Entry Time" value={stats.openTime?.slice(0, 5) || '—'} />
-                <StatRow label="Exit Time" value={(stats.isClosed && stats.closeTime?.slice(0, 5)) || '—'} />
-                <StatRow label="Hold Time" value={stats.fmtHold(stats.holdMinutes)} />
+                <StatRow label="Entry Time" value={legTime(stats.openDate, stats.openTime, trade.date) || '—'} />
+                <StatRow label="Exit Time" value={(stats.isClosed && legTime(stats.closeDate, stats.closeTime, trade.date)) || '—'} />
+                <StatRow label="Hold Time" value={fmtHold(stats.holdMinutes)} />
 
                 {editingStats ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--divider)' }}>
