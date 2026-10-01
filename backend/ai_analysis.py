@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from brain_tools import TOOL_SCHEMAS, run_tool
+from diary_matches import DIARY_ANALYSIS_SCHEMA, analyse_confidence
 
 load_dotenv()
 
@@ -178,6 +179,34 @@ def response_text(response) -> str:
     return "".join(parts).strip()
 
 
+def diary_tool_input(response) -> dict:
+    """Pull the structured payload off a forced tool_use response.
+
+    The diary analysis is requested with `tool_choice` pinned to
+    `record_diary_analysis`, so the answer arrives as an already-validated object
+    instead of prose that a regex has to scrape. This only has to find the block;
+    if the API ever answers in text anyway we fall back to parsing it, because a
+    hard failure here would lose an upload the user only gets one chance to make.
+    """
+    raise_if_truncated(response, "diary analysis")
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "tool_use" and isinstance(getattr(block, "input", None), dict):
+            return dict(block.input)
+    raw = response_text(response)
+    if not raw:
+        raise ValueError("The diary analysis came back empty — no structured result to read.")
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\n?', '', raw)
+        raw = re.sub(r'\n?```$', '', raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"The diary analysis was not readable as JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("The diary analysis was not a JSON object.")
+    return parsed
+
+
 # The per-trade JSON grows with the number of diary lines, and on Opus 5 adaptive
 # thinking spends from the SAME max_tokens budget, so a tight cap truncates the
 # JSON mid-string and json.loads() reports a meaningless column number instead of
@@ -261,6 +290,8 @@ Return only the JSON object."""
         model=get_model(),
         max_tokens=DIARY_MAX_TOKENS,
         system=DIARY_SYSTEM_PROMPT,
+        tools=[DIARY_ANALYSIS_SCHEMA],
+        tool_choice={"type": "tool", "name": "record_diary_analysis"},
         messages=[
             {
                 "role": "user",
@@ -282,8 +313,7 @@ Return only the JSON object."""
         ],
     )
 
-    raise_if_truncated(response, "diary photo analysis")
-    return _parse_response(response_text(response), entry_date)
+    return diary_tool_input(response)
 
 
 def analyze_diary_text(text_content: str, entry_date: str, trades_context: list[dict]) -> dict:
@@ -306,6 +336,8 @@ def analyze_diary_text(text_content: str, entry_date: str, trades_context: list[
         model=get_model(),
         max_tokens=DIARY_MAX_TOKENS,
         system=DIARY_SYSTEM_PROMPT,
+        tools=[DIARY_ANALYSIS_SCHEMA],
+        tool_choice={"type": "tool", "name": "record_diary_analysis"},
         messages=[{
             "role": "user",
             "content": f"""Entry date: {entry_date}
@@ -316,37 +348,15 @@ Trades executed on this date (match diary lines to these):
 Typed diary notes to analyze:
 {text_content}
 
-Parse each diary line, match to the trade records above, and return the JSON analysis.
-For each "Source: X" note create a tag with type "source". Return only the JSON object."""
+Parse each diary line, match to the trade records above, and return the structured analysis.
+For each "Source: X" note create a tag with type "source"."""
         }],
     )
 
-    raise_if_truncated(response, "diary analysis")
-    raw = response_text(response)
-    if raw.startswith('```'):
-        raw = re.sub(r'^```(?:json)?\n?', '', raw)
-        raw = re.sub(r'\n?```$', '', raw)
-
-    result = json.loads(raw)
-    result.setdefault('diary_date', entry_date)
-    result.setdefault('overall_summary', '')
-    result.setdefault('patterns_identified', [])
-    result.setdefault('improvement_areas', [])
-    result.setdefault('trade_analyses', [])
-    return result
+    return diary_tool_input(response)
 
 
-def _parse_response(raw_text: str, entry_date: str) -> dict:
-    if raw_text.startswith('```'):
-        raw_text = re.sub(r'^```(?:json)?\n?', '', raw_text)
-        raw_text = re.sub(r'\n?```$', '', raw_text)
-    result = json.loads(raw_text)
-    result.setdefault('diary_date', entry_date)
-    result.setdefault('overall_summary', '')
-    result.setdefault('patterns_identified', [])
-    result.setdefault('improvement_areas', [])
-    result.setdefault('trade_analyses', [])
-    return result
+
 
 
 def save_analysis_to_db(conn, diary_entry_id: int, analysis: dict):

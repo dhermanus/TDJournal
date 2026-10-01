@@ -85,7 +85,7 @@ Trade reconstruction, P&L, commissions, statistics, and other core trading calcu
   plus a Sources & Tags tab that scores where your ideas come from. One switch flips the whole page
   between bars and full numeric tables, and rows under ten trades are marked thin so a one-trade
   strategy at 100% cannot sit at the top
-- **Diary**: upload handwritten notes, screenshots, or typed text; Claude extracts strategy, stops, R-multiples, emotional state, and mistakes, and matches them to your actual trades
+- **Diary**: upload handwritten notes, screenshots, or typed text; Claude extracts strategy, stops, R-multiples, emotional state, and mistakes, and matches them to your actual trades. Every match is checked against the trades of that date and shown with a confidence level, weakest first; you confirm a match or correct any field yourself, and the diary card and Trade Detail always show the value you last set
 - **Day Review**: the session drawn as one picture, running P&L from the open to the close with every
   trade marked where you entered it, plus an AI coaching report graded on process rather than P&L.
   Each trade's grade carries the reason it was given

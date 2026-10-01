@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { ChevronDown, ChevronUp, BookOpen, Trash2 } from 'lucide-react';
-import { diaryApi, API_BASE } from '../api';
+import { diaryApi, tradesApi, API_BASE } from '../api';
 import { PageHeader } from './ui';
+import { numOr, detailOf, patchAnalysis as updateAnalysis } from './diaryReview';
 
 const BACKEND = API_BASE;
 
@@ -63,12 +64,140 @@ function DeleteButton({ onDelete, small, label = 'Delete' }) {
 
 const fieldLabel = { color: 'var(--text-secondary)', fontSize: 12.5, marginBottom: 3 };
 
+// A diary match the model guessed at is worth a second look; one a human
+// confirmed shows 'manual' and leaves the queue for good.
+function MatchReview({ ta, tradeGroup, confidence, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({
+    r_multiple: ta?.r_multiple ?? '',
+    stop_loss: ta?.stop_loss ?? '',
+    emotional_state: ta?.emotional_state ?? '',
+    mistakes: ta?.mistakes ?? '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const confirmed = confidence === 'manual';
+
+  const openEditor = () => {
+    if (!open) {
+      setForm({
+        r_multiple: ta?.r_multiple ?? '',
+        stop_loss: ta?.stop_loss ?? '',
+        emotional_state: ta?.emotional_state ?? '',
+        mistakes: ta?.mistakes ?? '',
+      });
+    }
+    setOpen(o => !o);
+    setError(null);
+  };
+
+  const confirm = async () => {
+    if (!tradeGroup) { setError('This diary line could not be matched to a trade.'); return; }
+    setBusy(true);
+    setError(null);
+    try {
+      await tradesApi.updateAnalysis(tradeGroup, { match_confidence: 'manual', match_notes: 'confirmed by you' });
+      onChange({ match_confidence: 'manual' });
+    } catch (e) {
+      setError(detailOf(e, 'Could not confirm this match.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveFields = async () => {
+    if (!tradeGroup) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const patch = {
+        r_multiple: numOr(form.r_multiple),
+        stop_loss: numOr(form.stop_loss),
+        emotional_state: form.emotional_state || null,
+        mistakes: form.mistakes || null,
+      };
+      if (!confirmed) {
+        patch.match_confidence = 'manual';
+        patch.match_notes = 'confirmed by you';
+      }
+      const res = await tradesApi.updateAnalysis(tradeGroup, patch);
+      onChange(res.data);
+      setOpen(false);
+    } catch (e) {
+      setError(detailOf(e, 'Could not save these fields.'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!tradeGroup) {
+    return (
+      <div className="notice" role="status" style={{ marginTop: 12, fontSize: 13.5 }}>
+        Not matched to any trade on this date — nothing to confirm.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 12, borderTop: '1px solid var(--divider-soft)', paddingTop: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button type="button" className="btn btn-sm" onClick={confirm} disabled={busy || confirmed}
+          aria-label={confirmed ? 'Match confirmed' : 'Confirm this diary match'}>
+          {confirmed ? 'Match confirmed' : busy ? 'Confirming…' : 'Confirm match'}
+        </button>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={openEditor}
+          aria-expanded={open} aria-label="Edit extracted fields">
+          {open ? 'Close' : 'Edit fields'}
+        </button>
+        {error && <span className="neg" role="alert" style={{ fontSize: 13 }}>{error}</span>}
+      </div>
+
+      {open && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginTop: 10 }}>
+          <label style={fieldLabel}>
+            R Multiple
+            <input type="number" step="0.01" className="input" value={form.r_multiple}
+              onChange={e => setForm(f => ({ ...f, r_multiple: e.target.value }))} />
+          </label>
+          <label style={fieldLabel}>
+            Stop Loss ($)
+            <input type="number" step="0.01" className="input" value={form.stop_loss}
+              onChange={e => setForm(f => ({ ...f, stop_loss: e.target.value }))} />
+          </label>
+          <label style={fieldLabel}>
+            Emotional State
+            <input type="text" className="input" value={form.emotional_state}
+              onChange={e => setForm(f => ({ ...f, emotional_state: e.target.value }))} />
+          </label>
+          <label style={fieldLabel}>
+            Mistakes
+            <input type="text" className="input" value={form.mistakes}
+              onChange={e => setForm(f => ({ ...f, mistakes: e.target.value }))} />
+          </label>
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: 8 }}>
+            <button type="button" className="btn btn-sm" onClick={saveFields} disabled={saving}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DiaryCard({ entry, onDeleted }) {
   const [expanded, setExpanded] = useState(false);
   // A .txt or .csv upload also stores a path, but only a picture can be shown as one.
   const hasImage = !!entry.image_path && /\.(png|jpe?g|webp|gif|heic|heif)$/i.test(entry.image_path);
-  const analysis = entry.ai_analysis;
+  const [analysis, setAnalysis] = useState(entry.ai_analysis);
   const panelId = `diary-entry-${entry.id}`;
+
+  // A field save or a confirmation changes one extraction: patch it in place so
+  // the card stays open instead of re-fetching and collapsing.
+  const patchAnalysis = (index, fields) => {
+    setAnalysis(prev => updateAnalysis(prev, index, fields));
+  };
 
   return (
     <div className="card" style={{ marginBottom: 'var(--space-3)' }}>
@@ -162,9 +291,23 @@ function DiaryCard({ entry, onDeleted }) {
                       {ta.strategy && <span className="chip accent">{ta.strategy}</span>}
                       <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', fontSize: 13, color: 'var(--text-secondary)', gap: 6 }}>
                         <ConfidenceDot level={ta.match_confidence} />
-                        {ta.match_confidence}
+                        {ta.match_confidence === 'manual' ? 'you confirmed' : ta.match_confidence}
                       </div>
                     </div>
+
+                    {/* The model's own verdict, kept when it differs from the
+                        check against the real trades — a disagreement is the
+                        thing worth seeing, not something to hide. */}
+                    {ta.model_match_confidence
+                      && ta.model_match_confidence !== ta.match_confidence
+                      && ta.match_confidence !== 'manual' && (
+                      <div className="notice" style={{ marginBottom: 12, fontSize: 13 }}>
+                        The model called this <strong>{ta.model_match_confidence}</strong>
+                        {ta.model_match_notes ? `: ${ta.model_match_notes}` : ''}.
+                        Checked against the trades on this date, it is{' '}
+                        <strong>{ta.match_confidence}</strong>{ta.match_notes ? ` — ${ta.match_notes}` : ''}.
+                      </div>
+                    )}
 
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, fontSize: 14, lineHeight: 1.5 }}>
                       {ta.entry_reason && (
@@ -206,6 +349,13 @@ function DiaryCard({ entry, onDeleted }) {
                         {ta.ai_feedback}
                       </div>
                     )}
+
+                    <MatchReview
+                      ta={ta}
+                      tradeGroup={ta.trade_group}
+                      confidence={ta.match_confidence}
+                      onChange={fields => patchAnalysis(i, fields)}
+                    />
                   </div>
                 ))}
               </div>

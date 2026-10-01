@@ -35,6 +35,7 @@ from ai_analysis import (
     generate_weekly_summary,
 )
 from daily_summary import build_daily_context, generate_daily_summary
+from diary_matches import analyse_confidence, queued_for_review
 import ai_settings
 from library import router as library_router, init_library_tables, apply_aliases, library_names
 import instruments
@@ -1143,11 +1144,21 @@ class AnalysisUpdate(BaseModel):
     idea_source: str | None = None
     stop_loss: float | None = None
     target_price: float | None = None
+    r_multiple: float | None = None
     emotional_state: str | None = None
     entry_reason: str | None = None
     exit_reason: str | None = None
     mistakes: str | None = None
     notes: str | None = None
+    # Match review: setting a confidence is how the user vouches for (or clears)
+    # a diary-to-trade match, so `manual` is accepted here although nothing in
+    # the AI path ever writes it.
+    match_confidence: str | None = None
+    match_notes: str | None = None
+
+
+# The model's own verdict on a match, so it survives an override for auditing.
+MATCH_LEVELS = {"high", "medium", "low", "ambiguous", "unmatched", "manual"}
 
 
 @app.patch("/api/trades/{trade_group:path}/analysis")
@@ -1157,6 +1168,8 @@ def update_trade_analysis(trade_group: str, data: AnalysisUpdate, conn: sqlite3.
         raise HTTPException(status_code=404, detail="Trade not found")
 
     updates = data.model_dump(exclude_unset=True)
+    if updates.get("match_confidence") is not None and updates["match_confidence"] not in MATCH_LEVELS:
+        raise HTTPException(status_code=422, detail="Unknown match confidence")
 
     existing = conn.execute("SELECT id FROM trade_analysis WHERE trade_group=?", (trade_group,)).fetchone()
     if not existing:
@@ -1672,6 +1685,10 @@ async def upload_diary(
         else:
             analysis = analyze_diary_entry(str(save_path.absolute()), date, trades_context)
         analysis = apply_aliases(conn, analysis)
+        # Judge the matches against this date's actual trades and store the
+        # fields as data — both have to happen before the analysis is saved,
+        # because they change what gets written.
+        analysis = analyse_confidence(analysis, trades_context)
         # Persist analysis
         conn.execute(
             "UPDATE diary_entries SET ai_analysis=? WHERE id=?",
@@ -1709,12 +1726,56 @@ def list_diary(
 
     rows = conn.execute(sql, params).fetchall()
     result = []
+
+    # The stored diary JSON is a record of what the model said at upload time;
+    # trade_analysis is the live row a user edits in TradeDetail (and a diary
+    # upload writes it too). The live copy is projected over the record only when
+    # the row belongs to this entry — a row created some other way, or already
+    # rewritten by a later diary, says nothing about this analysis, and taking
+    # its NULLs at face value would erase what the model found. Within its own
+    # entry it wins outright, NULL included: a field you cleared stays cleared,
+    # and the model's own match verdict survives as model_match_confidence.
+    EDITED_FIELDS = ("strategy", "idea_source", "stop_loss", "target_price", "r_multiple",
+                     "emotional_state", "entry_reason", "exit_reason", "mistakes", "notes")
+    MATCH_FIELDS = ("match_confidence", "match_notes")
+    current: dict[str, dict] = {}
+    if rows:
+        cols = [f"{f} AS live_{f}" for f in EDITED_FIELDS] + list(MATCH_FIELDS)
+        cols.append("diary_entry_id")
+        for r in conn.execute(
+            "SELECT trade_group, " + ", ".join(cols) + " FROM trade_analysis"
+        ).fetchall():
+            current[r["trade_group"]] = dict(r)
+
     for row in rows:
         d = row_to_dict(row)
         try:
-            d['ai_analysis'] = json.loads(d['ai_analysis']) if d.get('ai_analysis') else None
+            analysis = json.loads(d['ai_analysis']) if d.get('ai_analysis') else None
         except Exception:
-            d['ai_analysis'] = None
+            analysis = None
+        if isinstance(analysis, dict):
+            for ta in analysis.get('trade_analyses') or []:
+                if not isinstance(ta, dict) or not ta.get('trade_group'):
+                    continue
+                live = current.get(ta['trade_group'])
+                if not live or live.get('diary_entry_id') != d['id']:
+                    continue
+                if live.get("match_confidence") and live["match_confidence"] != ta.get("match_confidence"):
+                    ta.setdefault('model_match_confidence', ta.get('match_confidence'))
+                    ta.setdefault('model_match_notes', ta.get('match_notes'))
+                    ta['match_confidence'] = live['match_confidence']
+                    ta['match_notes'] = live.get('match_notes') or ta.get('match_notes')
+                for field in EDITED_FIELDS:
+                    ta[field] = live[f'live_{field}']
+        d['ai_analysis'] = analysis
+        queue = queued_for_review(analysis) if analysis else []
+        d['review_queue'] = [
+            {k: ta.get(k) for k in
+             ('ticker', 'trade_group', 'match_confidence', 'match_notes',
+              'model_match_confidence', 'model_match_notes')}
+            for ta in queue
+        ]
+        d['needs_review'] = len(queue)
         result.append(d)
 
     return result

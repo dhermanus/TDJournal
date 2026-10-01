@@ -405,6 +405,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
         idea_source: statsForm.idea_source || null,
         stop_loss: toNum(statsForm.stop_loss),
         target_price: toNum(statsForm.target_price),
+        r_multiple: toNum(statsForm.r_multiple),
         emotional_state: statsForm.emotional_state || null,
       });
       setAnalysis(res.data);
@@ -630,6 +631,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                           idea_source: analysis?.idea_source || 'Watchlist',
                           stop_loss: analysis?.stop_loss ?? '',
                           target_price: analysis?.target_price ?? '',
+                          r_multiple: analysis?.r_multiple ?? '',
                           emotional_state: analysis?.emotional_state || '',
                         });
                         setEditingStats(true);
@@ -683,6 +685,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                     </div>
                     <EditField label="Stop Loss ($)" type="number" value={String(statsForm.stop_loss)} onChange={v => setStatsForm(f => ({ ...f, stop_loss: v }))} />
                     <EditField label="Profit Target ($)" type="number" value={String(statsForm.target_price)} onChange={v => setStatsForm(f => ({ ...f, target_price: v }))} />
+                    <EditField label="R Multiple" type="number" value={String(statsForm.r_multiple)} onChange={v => setStatsForm(f => ({ ...f, r_multiple: v }))} />
                     <EditField label="Emotional State" value={statsForm.emotional_state} onChange={v => setStatsForm(f => ({ ...f, emotional_state: v }))} options={EMOTIONAL_STATES} />
                   </div>
                 ) : analysis && (
