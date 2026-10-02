@@ -56,7 +56,7 @@ const METRICS = [
     ],
   },
   {
-    category: 'Reports & Edge Analytics',
+    category: 'Reports',
     items: [
       {
         name: 'Time-of-Day P&L',
@@ -156,9 +156,9 @@ const FEATURES = [
     ],
   },
   {
-    name: 'Edge',
+    name: 'Reports',
     icon: '🎯',
-    description: 'Four behavioral analytics charts: R-Multiple Distribution, Emotion vs. Outcome, Mistake Frequency, and Hold Time. These reveal patterns invisible in raw P&L.',
+    description: 'The analytics charts. R-Multiple Distribution and Hold Time sit in the Execution tab; Emotion vs. Outcome and Mistake Frequency sit in Psychology. These reveal patterns invisible in raw P&L.',
     tips: [
       'R-Multiple and Emotion data require filling in the analysis fields on each trade.',
       'Mistake frequency comes from both diary AI tagging and manual trade notes.',
@@ -175,9 +175,9 @@ const FEATURES = [
     ],
   },
   {
-    name: 'Strategies',
+    name: 'By Strategy',
     icon: '📊',
-    description: 'P&L, win rate, and trade count broken down by strategy name. Strategy names come from your diary AI analysis.',
+    description: 'P&L, win rate, and trade count broken down by strategy name. Find it in Reports → Setups & Strategy → By Strategy. Strategy names come from your diary AI analysis.',
     tips: [
       'Upload diary entries to start populating strategy data.',
       'Strategies with negative P&L across 10+ trades are signals to reduce size or stop trading that setup.',

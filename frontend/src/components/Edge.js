@@ -1,27 +1,14 @@
-import { useState, useEffect } from 'react';
+// The four behavioural charts, split out so Reports can place them in its own
+// tabs. There is no Edge page: `export default function Edge` used to be one
+// and nothing ever routed it — Help still advertised it — so it was deleted
+// along with the `Section` shell and the fetch it owned. These stay as charts.
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell, ReferenceLine,
 } from 'recharts';
-import { edgeReportApi } from '../api';
-import DateRangePicker from './DateRangePicker';
 
 const fmt$ = (v) =>
   `$${Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-
-function Section({ title, children }) {
-  return (
-    <div className="card" style={{ padding: '20px 24px 24px' }}>
-      <div style={{
-        fontSize: 13, fontWeight: 600, color: 'var(--text-muted)',
-        textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 16,
-      }}>
-        {title}
-      </div>
-      {children}
-    </div>
-  );
-}
 
 function NoData({ msg }) {
   return (
@@ -155,72 +142,6 @@ export function HoldTime({ data }) {
           {bars[1].value > bars[0].value
             ? `You hold losers ${(bars[1].value / bars[0].value).toFixed(1)}x longer than winners. Consider cutting losses faster.`
             : `You hold winners ${(bars[0].value / bars[1].value).toFixed(1)}x longer than losers. Good discipline, letting winners run.`}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default function Edge({ accountId }) {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-
-  useEffect(() => {
-    setLoading(true);
-    const params = {};
-    if (accountId != null) params.account_id = accountId;
-    if (dateFrom) params.date_from = dateFrom;
-    if (dateTo) params.date_to = dateTo;
-    edgeReportApi.get(params)
-      .then(r => { setData(r.data); setLoading(false); })
-      .catch(() => { setData(null); setLoading(false); });
-  }, [accountId, dateFrom, dateTo]);
-
-  return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, flexWrap: 'wrap', gap: 10 }}>
-        <div>
-          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 2 }}>Edge Analytics</h2>
-          <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
-            {data ? `${data.total_trades || 0} trades` : 'Loading...'}
-            {data?.expectancy != null && (
-              <span style={{ marginLeft: 12, color: data.expectancy >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
-                Expectancy: {data.expectancy >= 0 ? '+' : ''}{fmt$(data.expectancy)}/trade
-              </span>
-            )}
-          </div>
-        </div>
-        <DateRangePicker
-          dateFrom={dateFrom}
-          dateTo={dateTo}
-          onChange={({ dateFrom: f, dateTo: t }) => { setDateFrom(f); setDateTo(t); }}
-        />
-      </div>
-
-      {loading ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {[1, 2, 3, 4].map(i => <div key={i} className="skeleton" style={{ height: 220 }} />)}
-        </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-            <Section title="R-Multiple Distribution">
-              <RMultipleDist data={data?.r_multiple_dist} />
-            </Section>
-            <Section title="Hold Time, Winners vs. Losers">
-              <HoldTime data={data?.hold_time} />
-            </Section>
-          </div>
-
-          <Section title="Emotion vs. Outcome">
-            <EmotionTable data={data?.emotion_outcomes} />
-          </Section>
-
-          <Section title="Mistake Frequency">
-            <MistakeFreq data={data?.mistake_frequency} />
-          </Section>
         </div>
       )}
     </div>
