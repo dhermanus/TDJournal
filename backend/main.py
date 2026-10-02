@@ -46,6 +46,7 @@ from library import router as library_router, init_library_tables, apply_aliases
 import instruments
 import mt5_time
 import backup
+import import_batch
 
 load_dotenv()
 
@@ -875,6 +876,21 @@ async def import_csv(
     # said so. The generic template and MT5 refuse the whole file instead, so
     # they add nothing here.
     line_errors: list[str] = []
+
+    # Snapshot before parsing, because parsing writes: it merges fills into open
+    # option positions and commits, so anything captured afterwards would hold the
+    # merged row rather than the original. Only options are at risk (the merge is
+    # guarded on instrument_type), and stock positions are never auto-merged.
+    # The rest of the picture has to wait — the group list the import will touch
+    # only exists once parsing has produced it — so it is taken after the parse
+    # and merged, with this earlier one winning for the groups it already knows.
+    early = import_batch.capture(
+        conn, account_id, import_batch.open_option_groups(conn, account_id))
+    # The whole account, before the parse touches it: the diff of this against
+    # the same query after _persist_import is the only answer to "did anything
+    # change?", because both halves of the import can write on their own.
+    journal_before = _journal_trades(conn, account_id)
+
     trades, skipped = parse_broker_csv(
         content, broker, account_id, conn, tz_name=_mt5_timezone(conn),
         problems=line_errors,
@@ -882,13 +898,38 @@ async def import_csv(
     report = skipped if isinstance(skipped, dict) else None
     skipped_deals = report.get("skipped_deals", skipped) if report else skipped
 
+    # Taken here, not inside _persist_import: that function also deletes the rows
+    # `_replace_regrouped_trades` is about to move, and a snapshot taken after a
+    # delete is a picture of the thing we want to restore.
+    touched = ({t["trade_group"] for t in trades}
+               | {g for t in trades for g in (t.get("replaces") or [])}
+               | set(early["groups"]))
+    pre = import_batch.merge(early, import_batch.capture(conn, account_id, touched))
+
     imported, errors = _persist_import(conn, account_id, trades)
+    changed = _journal_trades(conn, account_id) != journal_before
+
+    # `pre` holds only rows that existed before: created trades contribute an
+    # empty list, and their group still has to be in the snapshot, because that
+    # is what undo deletes. So it is stored as-is — no filtering, or a brand-new
+    # trade would be undone not at all.
+    batch_id = import_batch.record(
+        conn, account_id,
+        filename=(file.filename or ""),
+        broker=(broker or "auto"),
+        snapshot=pre,
+        imported=imported, skipped=skipped_deals,
+        line_error_count=len(line_errors),
+        write_error_count=len(errors),
+        changed=changed,
+    )
 
     return {
         "imported": imported,
         "skipped": skipped_deals,
         "errors": errors,
         "line_errors": line_errors,
+        "batch_id": batch_id,
         "message": (
             f"Imported {imported} MT5 position(s). "
             f"Skipped {skipped_deals} previously imported deal(s). "
@@ -902,6 +943,33 @@ async def import_csv(
         ),
         "details": report,
     }
+
+
+@app.get("/api/import-batches")
+def get_import_batches(
+    account_id: int,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Recent imports for an account, newest first, without their snapshots."""
+    if not conn.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+        raise ValueError(f"Account {account_id} not found")
+    return {"batches": import_batch.list_batches(conn, account_id)}
+
+
+@app.post("/api/import-batches/{batch_id}/undo")
+def undo_import(
+    batch_id: int,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Put the journal back to how it looked before that import.
+
+    Journal data only — trades, analysis, tags, attachments. Diary entries and M1
+    bars are separate workflows and are not part of an import's blast radius.
+    Refuses (400) rather than guessing when the batch is already undone or when
+    a later import sits on top of it, because restoring an older snapshot over a
+    newer one would silently discard that newer work.
+    """
+    return import_batch.undo(conn, batch_id)
 
 
 def _dst_note(report: dict) -> str:

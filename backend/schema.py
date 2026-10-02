@@ -188,11 +188,31 @@ BASE_STATEMENTS = [
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS import_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id),
+        filename TEXT NOT NULL DEFAULT '',
+        broker TEXT NOT NULL DEFAULT '',
+        -- JSON: {"groups": [...], "trades": [...], "analysis": [...],
+        --         "tags": [...], "attachments": [...]} — every row the import
+        -- was about to touch, as it was *before* the import, so Undo can put
+        -- the journal back rather than infer what it used to look like.
+        snapshot TEXT NOT NULL DEFAULT '{}',
+        imported INTEGER NOT NULL DEFAULT 0,
+        skipped INTEGER NOT NULL DEFAULT 0,
+        line_error_count INTEGER NOT NULL DEFAULT 0,
+        write_error_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        undone_at TEXT
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_trades_account_date ON trades(account_id, date)",
     "CREATE INDEX IF NOT EXISTS idx_trades_group ON trades(trade_group)",
     "CREATE INDEX IF NOT EXISTS idx_analysis_group ON trade_analysis(trade_group)",
     "CREATE INDEX IF NOT EXISTS idx_tags_group ON trade_tags(trade_group)",
     "CREATE INDEX IF NOT EXISTS idx_attachments_trade ON trade_attachments(trade_group, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_batches_account ON import_batches(account_id, id)",
 ]
 
 
