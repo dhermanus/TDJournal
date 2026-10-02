@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import sqlite3
 import tempfile
 import aiofiles
@@ -1645,6 +1646,10 @@ ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '
 ALLOWED_TEXT_EXTENSIONS = {'.txt', '.csv'}
 ALLOWED_DIARY_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | ALLOWED_TEXT_EXTENSIONS
 
+# ISO date, zero-padded and fixed width, so it cannot carry a path segment and
+# cannot be stored in a form entry_date would never match against.
+_DIARY_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
 
 @app.post("/api/upload-diary")
 async def upload_diary(
@@ -1657,7 +1662,17 @@ async def upload_diary(
     # endpoint's whole purpose (upload → Claude → entry) must not happen at all,
     # so the notice can honestly say nothing was saved and nothing was sent.
     require_feature(conn, "diary")
-    ext = Path(file.filename).suffix.lower()
+    # `date` is the first component of the stored path, so it is validated like
+    # the value it is rather than trusted because a browser sent it. Before this,
+    # date="../../x" wrote outside UPLOAD_DIR — proven by a test upload that
+    # landed a file in the temp dir's parent. The exact-width match is there for
+    # more than the path: entry_date is stored verbatim and compared to trade
+    # dates, so `2026-7-1` would import fine and then match no trade. strptime
+    # adds the calendar check (2026-02-30 is refused); both raise → 400.
+    if not _DIARY_DATE_RE.fullmatch(date):
+        raise ValueError("date must be a calendar date as YYYY-MM-DD.")
+    datetime.strptime(date, "%Y-%m-%d")
+    ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_DIARY_EXTENSIONS:
         raise ValueError(f"File must be one of {ALLOWED_DIARY_EXTENSIONS}")
 
@@ -1665,8 +1680,12 @@ async def upload_diary(
     if not account:
         raise ValueError(f"Account {account_id} not found")
 
-    # Save image file
-    safe_name = f"{date}_{account_id}_{file.filename.replace(' ', '_')}"
+    # Save image file. The uploaded name is data, not a path: strip anything
+    # that could act as one (same helper attachments.py uses for its own display
+    # names) and re-append the extension already checked against the allowlist,
+    # so the frontend can still recognise an image from image_path.
+    stem = Path(attachments.sanitize_display_name(file.filename)).stem or "image"
+    safe_name = f"{date}_{account_id}_{stem}{ext}"
     save_path = Path(UPLOAD_DIR) / safe_name
 
     raw = await file.read()
@@ -1690,6 +1709,16 @@ async def upload_diary(
             raise ValueError(
                 "Could not convert this HEIC photo. On iPhone, Settings > Camera > "
                 f"Formats > Most Compatible saves as JPEG instead. ({exc})")
+
+    # Belt and braces: resolve and require the result to still be inside
+    # UPLOAD_DIR, exactly as attachments.attachment_path() does for its own
+    # files. Both inputs are already validated, so this can only fire if a
+    # future edit re-introduces a path segment — and then it fires as a
+    # ValueError (400) instead of a silent write or an open() ENOENT (404).
+    uploads_root = Path(UPLOAD_DIR).resolve()
+    resolved = save_path.resolve()
+    if resolved.parent != uploads_root:
+        raise ValueError("That filename cannot be stored safely.")
 
     async with aiofiles.open(save_path, 'wb') as f:
         await f.write(raw)
