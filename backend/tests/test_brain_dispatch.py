@@ -42,18 +42,52 @@ class Turn:
                         for b in content]
 
 
+class FakeStream:
+    """A `messages.stream(...)` context manager yielding a scripted turn.
+
+    Mirrors the real one: `text_stream` gives the text as it arrives, and
+    `get_final_message()` afterwards returns the accumulated message — which is
+    exactly how the production loop drives both streaming and tool dispatch.
+    """
+    def __init__(self, turn):
+        self.turn = turn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def text_stream(self):
+        for block in self.turn.content:
+            if block.type == "text" and block.text:
+                yield block.text
+
+    def get_final_message(self):
+        return self.turn
+
+
 class FakeClient:
     """Returns each scripted turn in order, recording what it was asked."""
     def __init__(self, turns):
         self.turns = list(turns)
         self.calls = []
+        self.streamed = 0
 
         class Messages:
             def __init__(self, outer):
                 self.outer = outer
-            def create(self, **kwargs):
+            def _next(self, kwargs):
                 self.outer.calls.append(kwargs)
                 return self.outer.turns.pop(0) if self.outer.turns else Turn("end_turn", ["done"])
+            def create(self, **kwargs):
+                return self._next(kwargs)
+            def stream(self, **kwargs):
+                # Brain now answers through the streaming API; record the same
+                # kwargs so the tool/system assertions keep reading it as one.
+                self.outer.streamed += 1
+                return FakeStream(self._next(kwargs))
         self.messages = Messages(self)
 
 

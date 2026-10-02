@@ -32,6 +32,7 @@ from ai_analysis import (
     generate_insights,
     build_brain_context,
     generate_brain_response,
+    brain_turn,
     generate_weekly_summary,
 )
 from daily_summary import build_daily_context, generate_daily_summary
@@ -3065,25 +3066,64 @@ def get_daily_summary(
 # ── Brain AI Chatbot ────────────────────────────────────────────────────────────
 
 from fastapi import Request as FastAPIRequest
+from fastapi.responses import StreamingResponse
+
+
+def _brain_request(body: dict, conn: sqlite3.Connection):
+    """Parse and gate a Brain request. Raises before anything is built."""
+    messages = body.get("messages", [])
+    account_id = body.get("account_id")
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages provided")
+    require_feature(conn, "brain")
+    forget_usage()
+    return messages, account_id
+
 
 @app.post("/api/brain")
 async def brain_chat(
     req: FastAPIRequest,
     conn: sqlite3.Connection = Depends(get_connection),
 ):
-    body = await req.json()
-    messages = body.get("messages", [])
-    account_id = body.get("account_id")
-
-    if not messages:
-        raise HTTPException(status_code=400, detail="No messages provided")
-    require_feature(conn, "brain")
-    forget_usage()
-
+    """One whole answer as JSON. Kept for callers that do not need tokens."""
+    messages, account_id = _brain_request(await req.json(), conn)
     try:
         context = build_brain_context(conn, account_id)
-        response_text = generate_brain_response(messages, context, conn, account_id)
-        return {"response": response_text, "ai_usage": _ai_usage_payload(last_usage())}
+        text = generate_brain_response(messages, context, conn, account_id)
+        return {"response": text, "ai_usage": _ai_usage_payload(last_usage())}
     except Exception as e:
         status, detail = friendly_error(e)
         raise HTTPException(status_code=status, detail=detail)
+
+
+@app.post("/api/brain/stream")
+async def brain_chat_stream(
+    req: FastAPIRequest,
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Newline-delimited JSON events: {"type": "delta"|"usage"|"error", ...}.
+
+    The generator runs in the threadpool the way FastAPI runs sync generators,
+    so the tool loop and the SDK call block a worker thread rather than the
+    event loop. Aborting the fetch closes the response, which closes the
+    generator, which closes the SDK stream — that chain is what makes Stop
+    actually stop instead of letting the answer finish unseen.
+    """
+    messages, account_id = _brain_request(await req.json(), conn)
+    context = build_brain_context(conn, account_id)
+
+    def events():
+        for kind, payload in brain_turn(messages, context, conn, account_id):
+            if kind == "delta":
+                yield json.dumps({"type": "delta", "text": payload}) + "\n"
+            elif kind == "usage":
+                yield json.dumps({"type": "usage",
+                                  "ai_usage": _ai_usage_payload(payload)}) + "\n"
+            elif kind == "error":
+                yield json.dumps({"type": "error",
+                                  "detail": payload["message"],
+                                  "status": payload["status"]}) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"X-Accel-Buffering": "no",
+                                      "Cache-Control": "no-cache"})

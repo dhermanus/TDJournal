@@ -94,8 +94,10 @@ Trade reconstruction, P&L, commissions, statistics, and other core trading calcu
 - **Brain**: a chat that answers questions about your trading history. It reads your journal
   through read-only query tools — totals, individual trades, breakdowns by strategy, symbol,
   weekday or day, and your diary — so every figure it quotes is computed by the app, not by
-  the model. Its stable prompt is marked for API caching, and retries handle temporary
-  rate limits and endpoint errors without making the numbers less trustworthy
+  the model. Answers stream in as they are written, with a Stop button that ends the turn
+  (and the billing) rather than letting it finish unseen. Its stable prompt is marked for API
+  caching, and retries handle temporary rate limits and endpoint errors without making the
+  numbers less trustworthy
 - **Settings**: the name library. Strategies, sources and tags in one place, with rename, merge and
   delete. Merging rewrites every trade that used the old name and remembers it, so the next diary
   analysis that produces the duplicate saves it under the name you kept

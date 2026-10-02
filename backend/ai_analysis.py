@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from brain_tools import TOOL_SCHEMAS, run_tool
 from diary_matches import DIARY_ANALYSIS_SCHEMA, analyse_confidence
-from ai_usage import create_client
+from ai_usage import create_client, friendly_error, record_usage
 
 load_dotenv()
 
@@ -737,13 +737,46 @@ def generate_weekly_summary(week_context: dict) -> dict:
     return result
 
 
-def generate_brain_response(messages: list[dict], context: str, conn=None, account_id=None) -> str:
-    """Answer one Brain turn, calling the read-only journal tools as needed.
+EMPTY_ANSWER_PLAIN = (
+    "I don't have an answer for that yet. Try asking it a different way."
+)
+EMPTY_ANSWER_EXHAUSTED = (
+    "I couldn't finish that answer after several data lookups. "
+    "Please try a narrower question."
+)
+
+
+def _brain_stream(client, *, system, messages, tools, model):
+    """Yield ("delta", text) as it arrives, then ("final", response).
+
+    The `with` is load-bearing: closing the stream releases the HTTP connection,
+    which is what makes the browser's Stop button actually stop paying for
+    tokens instead of letting the answer finish into a void.
+    """
+    with client.messages.stream(
+        model=model,
+        max_tokens=2048,
+        system=system,
+        messages=messages,
+        **({"tools": tools} if tools else {}),
+    ) as stream:
+        for delta in stream.text_stream:
+            yield ("delta", delta)
+        yield ("final", stream.get_final_message())
+
+
+def brain_turn(messages: list[dict], context: str, conn=None, account_id=None):
+    """Drive one Brain turn, yielding ("delta"|"usage"|"error", payload).
 
     Every number in the reply comes from `brain_tools`, never from the model:
     the tools run fixed SQL against this connection, scoped to `account_id`, and
-    the model only explains what they return. `context` is the small standing
+    the model only explains what it returns. `context` is the small standing
     summary (account overview) so a first answer needs no tool call at all.
+
+    Text the model emits before asking for a tool is its own narration ("let me
+    check your trades") and is streamed like everything else. A blank line is
+    inserted when a further round follows so two rounds cannot run together as
+    "...did see that. There were 3 trades".
     """
     client = get_client()
 
@@ -759,38 +792,105 @@ def generate_brain_response(messages: list[dict], context: str, conn=None, accou
 
     tools = cached_tools(TOOL_SCHEMAS) if conn is not None else None
     system = cached_system(BRAIN_SYSTEM_PROMPT)
-    for _ in range(BRAIN_MAX_TOOL_ROUNDS):
-        response = client.messages.create(
-            model=get_model(),
-            max_tokens=2048,
-            system=system,
-            messages=claude_messages,
-            **({"tools": tools} if tools else {}),
-        )
-        if response.stop_reason != "tool_use" or conn is None:
-            return response_text(response)
+    narrated = False
+    try:
+        for _ in range(BRAIN_MAX_TOOL_ROUNDS):
+            if narrated:
+                yield ("delta", "\n\n")
 
-        claude_messages.append({"role": "assistant", "content": response.content})
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            # A rejected call still has to be answered so the conversation
-            # stays well-formed; the model sees the reason and can retry. Both
-            # bad input and a query failure become a readable result rather
-            # than a 500 for the whole turn.
-            try:
-                result = run_tool(block.name, block.input, conn, account_id)
-            except (ValueError, sqlite3.Error) as exc:
-                result = json.dumps({"error": str(exc)})
-            claude_messages.append({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": block.id,
-                             "content": result, "is_error": result.startswith('{"error"')}],
-            })
-    # Looped too many times: answer from the standing summary rather than
-    # hammering the endpoint.
-    final = response_text(client.messages.create(
-        model=get_model(), max_tokens=2048, system=system,
-        messages=claude_messages + [{"role": "user",
-            "content": "Stop calling tools. Answer from what you already have."}]))
-    return final or "I couldn't finish that answer after several data lookups. Please try a narrower question."
+            response = None
+            for event, value in _brain_stream(
+                client, system=system, messages=claude_messages, tools=tools,
+                model=get_model(),
+            ):
+                if event == "delta":
+                    narrated = True
+                    yield ("delta", value)
+                else:
+                    response = value
+
+            if response is None:
+                yield ("error", {"status": 502,
+                                 "message": "The AI stream ended before a response was complete."})
+                return
+
+            if response.stop_reason != "tool_use" or conn is None:
+                # An empty answer would leave the panel blank with no clue why,
+                # on the ordinary path as much as the exhausted one.
+                if not response_text(response):
+                    yield ("delta", EMPTY_ANSWER_PLAIN)
+                yield ("usage", record_usage(response))
+                return
+
+            claude_messages.append({"role": "assistant", "content": response.content})
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                # A rejected call still has to be answered so the conversation
+                # stays well-formed; the model sees the reason and can retry.
+                # Both bad input and a query failure become a readable result
+                # rather than a 500 for the whole turn.
+                try:
+                    result = run_tool(block.name, block.input, conn, account_id)
+                except (ValueError, sqlite3.Error) as exc:
+                    result = json.dumps({"error": str(exc)})
+                claude_messages.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": block.id,
+                                 "content": result,
+                                 "is_error": result.startswith('{"error"')}],
+                })
+
+        # Looped too many times: answer from the standing summary rather than
+        # hammering the endpoint.
+        if narrated:
+            yield ("delta", "\n\n")
+        response = None
+        for event, value in _brain_stream(
+            client, system=system,
+            messages=claude_messages + [{"role": "user",
+                "content": "Stop calling tools. Answer from what you already have."}],
+            tools=tools, model=get_model(),
+        ):
+            if event == "delta":
+                yield ("delta", value)
+            else:
+                response = value
+        if response is None:
+            yield ("error", {"status": 502,
+                             "message": "The AI stream ended before a response was complete."})
+            return
+        if not response_text(response):
+            yield ("delta", EMPTY_ANSWER_EXHAUSTED)
+        yield ("usage", record_usage(response))
+    except Exception as exc:  # noqa: BLE001 - end the response rather than strand the UI
+        status, message = friendly_error(exc)
+        yield ("error", {"status": status, "message": message})
+
+
+def generate_brain_response(messages: list[dict], context: str, conn=None,
+                            account_id=None) -> str:
+    """Consume the same stream the SSE route uses and return the whole answer.
+
+    One implementation for both paths: anything the browser watches arrive token
+    by token is exactly what this joins back together.
+    """
+    parts = []
+    failure = None
+    usage = None
+    for kind, payload in brain_turn(messages, context, conn, account_id):
+        if kind == "delta":
+            parts.append(payload)
+        elif kind == "usage":
+            usage = payload
+        elif kind == "error":
+            failure = payload["message"]
+    # Re-record so the caller's `last_usage()` describes this answer even when
+    # the turn it joined did not go through the loop's own record call.
+    if usage:
+        record_usage(usage)
+    text = "".join(parts).strip()
+    if failure and not text:
+        raise RuntimeError(failure)
+    return text
+

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { X, Send, Brain as BrainIcon } from 'lucide-react';
+import { X, Send, Square, Brain as BrainIcon } from 'lucide-react';
 import { brainApi } from '../api';
 import { usageLine } from './aiUsage';
 
@@ -73,6 +73,11 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
   // What the most recent answer cost, shown under the composer: a per-turn
   // figure rather than a running total, so it always describes what is on screen.
   const [lastUsage, setLastUsage] = useState(null);
+  // The in-flight answer, so tokens render as they arrive. Kept in state rather
+  // than appended per delta to keep the chat history untouched until the turn
+  // is actually finished (or deliberately stopped).
+  const [streaming, setStreaming] = useState(null);
+  const abortRef = useRef(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const launcherRef = useRef(null);
@@ -80,13 +85,20 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
+  }, [messages, loading, streaming]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();
     else if (wasOpen.current) launcherRef.current?.focus();
     wasOpen.current = open;
   }, [open]);
+
+  // Stop only means something if abandoning the answer also stops the model:
+  // aborting the fetch closes the response, which closes the server-side
+  // generator, which closes the SDK stream. Nothing is billed past this point.
+  const stop = () => {
+    if (abortRef.current) abortRef.current.abort();
+  };
 
   const send = async (text) => {
     const msg = (text || input).trim();
@@ -97,14 +109,41 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
     const nextMessages = [...messages, userMsg];
     setMessages(nextMessages);
     setLoading(true);
+    setStreaming('');
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let shown = '';
 
     try {
-      const res = await brainApi.chat(nextMessages, accountId);
-      setMessages(prev => [...prev, { role: 'assistant', content: res.data.response }]);
-      setLastUsage(res.data.ai_usage || null);
+      const res = await brainApi.stream(nextMessages, accountId, {
+        signal: controller.signal,
+        onDelta: (delta) => {
+          shown += delta;
+          setStreaming(shown);
+        },
+      });
+      setMessages(prev => [...prev, { role: 'assistant', content: res.text || shown }]);
+      setLastUsage(res.ai_usage || null);
+      if (res.failure) {
+        setMessages(prev => [...prev, { role: 'assistant', content: `Stopped: ${res.failure.detail}` }]);
+      }
     } catch (e) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${e.response?.data?.detail || e.message}` }]);
+      const aborted = e && e.name === 'AbortError';
+      const detail = e?.detail || e?.response?.data?.detail || e?.message;
+      if (aborted) {
+        // Keep whatever arrived: a half answer you stopped is still yours.
+        if (shown) setMessages(prev => [...prev, { role: 'assistant', content: `${shown}\n\n*(stopped)*` }]);
+        // No usage event follows an abort, so the previous turn's cost is all
+        // we have — and it describes a different answer. Show nothing rather
+        // than a figure the reader would attribute to this one.
+        setLastUsage(null);
+      } else {
+        setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${detail}` }]);
+      }
     } finally {
+      abortRef.current = null;
+      setStreaming(null);
       setLoading(false);
     }
   };
@@ -164,7 +203,26 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
               </div>
             ))}
 
-            {loading && (
+            {/* The answer as it arrives, before it is finished. The dots show
+                only until the first token lands: after that the text itself is
+                the progress indicator, and once the turn completes the text
+                moves into `messages`. */}
+            {typeof streaming === 'string' && streaming.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                <div style={{
+                  maxWidth: '88%',
+                  padding: '9px 12px',
+                  borderRadius: '10px 10px 10px 3px',
+                  background: 'var(--surface-inset)',
+                  border: '1px solid var(--divider-soft)',
+                  color: 'var(--text-primary)',
+                }}>
+                  <Markdown text={streaming} />
+                </div>
+              </div>
+            )}
+
+            {loading && (typeof streaming !== 'string' || !streaming.length) && (
               <div style={{ alignSelf: 'flex-start', padding: '10px 14px', background: 'var(--surface-inset)', border: '1px solid var(--divider-soft)', borderRadius: '10px 10px 10px 3px', display: 'flex', gap: 4, alignItems: 'center' }} aria-label="Brain is thinking">
                 {[0, 1, 2].map(j => (
                   <div key={j} style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-line)', animation: `pulse 1s ${j * 0.2}s infinite` }} />
@@ -195,15 +253,29 @@ export default function Brain({ accountId, open: openProp, onOpenChange }) {
               disabled={loading}
               style={{ flex: 1, fontSize: 14 }}
             />
-            <button
-              type="button"
-              className="btn btn-primary btn-icon"
-              onClick={() => send()}
-              disabled={loading || !input.trim()}
-              aria-label="Send message"
-            >
-              <Send size={15} />
-            </button>
+            {/* While an answer is streaming the send button becomes Stop: one
+                control in one place, and the button that could start the spend
+                is the one that ends it. */}
+            {loading ? (
+              <button
+                type="button"
+                className="btn btn-secondary btn-icon"
+                onClick={stop}
+                aria-label="Stop generating"
+              >
+                <Square size={15} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-primary btn-icon"
+                onClick={() => send()}
+                disabled={!input.trim()}
+                aria-label="Send message"
+              >
+                <Send size={15} />
+              </button>
+            )}
           </div>
         </div>
       ) : (

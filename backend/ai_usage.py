@@ -93,6 +93,22 @@ def last_usage() -> dict | None:
     return _recorder.last()
 
 
+def record_usage(response) -> dict:
+    """Record usage from a completed response, or from an already-built record.
+
+    Both forms are accepted because the Brain loop finishes its own call (and so
+    hands back a response) while `generate_brain_response` re-records what the
+    stream reported. Without the second form the JSON route would report
+    `spent: false` for an answer it had just paid for, since the only thing
+    populating the recorder would be loop internals nobody outside can see.
+    """
+    if isinstance(response, dict):
+        record = dict(response)
+        _recorder._local.record = record
+        return record
+    return _recorder.record(response)
+
+
 def forget_usage() -> None:
     """Drop the last call's numbers, so an endpoint can tell 'spent nothing'
     apart from 'spent whatever the previous endpoint spent'."""

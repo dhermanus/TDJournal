@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { consumeBrainStream, bodyChunks } from './components/brainStream';
 
 // Defaults to the local backend. REACT_APP_API_URL can point the frontend at
 // another origin (a second instance, a container, a LAN machine).
@@ -82,6 +83,41 @@ export const calendarApi = {
 export const brainApi = {
   chat: (messages, accountId) =>
     api.post('/api/brain', { messages, account_id: accountId }),
+
+  /**
+   * Stream one Brain turn, calling `onDelta(text)` as each piece arrives.
+   *
+   * Plain `fetch` rather than axios: the response is newline-delimited JSON
+   * read line by line, and `signal` is what the Stop button passes so the
+   * request is actually torn down instead of leaving the model to finish into
+   * a socket nobody is reading.
+   *
+   * Resolves to { text, ai_usage }. Rejects with { status, detail } so the
+   * caller can show the server's own words for a rate limit or a bad key.
+   */
+  stream: async (messages, accountId, { signal, onDelta } = {}) => {
+    const res = await fetch(`${API_BASE}/api/brain/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, account_id: accountId }),
+      signal,
+    });
+
+    if (!res.ok) {
+      let detail = `Request failed (${res.status})`;
+      try {
+        const body = await res.json();
+        if (typeof body?.detail === 'string' && body.detail) detail = body.detail;
+      } catch (e) { /* keep the status message */ }
+      throw { status: res.status, detail };
+    }
+
+    const chunks = bodyChunks(res);
+    if (!chunks) throw { status: 500, detail: 'This browser cannot stream the response.' };
+    const { text, ai_usage: usage, failure } = await consumeBrainStream(chunks, { onDelta });
+    if (failure && !text.trim()) throw failure;
+    return { text, ai_usage: usage, ...(failure ? { failure } : {}) };
+  },
 };
 
 export const dailySummaryApi = {
