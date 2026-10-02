@@ -2,6 +2,7 @@ import re
 import json
 import csv
 import io
+import collections
 from datetime import datetime
 
 import instruments
@@ -165,8 +166,20 @@ def parse_futures_description(description: str) -> dict | None:
 
 
 def parse_cash_description(description: str) -> dict | None:
-    """Try option first (more specific), then stock."""
+    """Try option, then futures, then stock.
+
+    Futures was missing here: this section's `continue` on an unknown description
+    made a fill disappear with no count and no error, so both legs of a round trip
+    in Cash Balance produced an import of nothing that still reported success.
+    The stock pattern cannot match `/ES` (no leading slash), so the order carries
+    no ambiguity. Unlike the Futures Statements section, this section's AMOUNT
+    column is broker truth and `parsed.update(...)` in the caller overwrites
+    whatever this returns — the multiplier here only classifies the row.
+    """
     result = parse_option_description(description)
+    if result:
+        return result
+    result = parse_futures_description(description)
     if result:
         return result
     return parse_stock_description(description)
@@ -364,6 +377,18 @@ def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
                 option_strike = None
             option_type = type_str
             multiplier = 100
+        elif type_str in ('FUT', 'FUTURE', 'FUTURES', '_FUT') or symbol.startswith('/'):
+            # Trade History's FUT/ROOT row is separate from the Cash Balance
+            # futures section. Do not fall through to STOCK: /ES 5 points is
+            # $250, not $5. The broker-supplied point multiplier is in this
+            # repo's known-root map; unknown roots are refused rather than guessed.
+            instrument_type = 'FUTURE'
+            option_expiry = None
+            option_strike = None
+            option_type = None
+            multiplier = _point_value(symbol, 'FUTURE')
+            if multiplier is None:
+                continue
         else:
             instrument_type = 'STOCK'
             option_expiry = None
@@ -584,21 +609,28 @@ def execution_fingerprint(exec_dict: dict) -> str:
     return f"{date}|{exec_dict.get('time','')}|{exec_dict.get('ticker','')}|{exec_dict.get('action','')}|{exec_dict.get('qty','')}|{exec_dict.get('price','')}"
 
 
-def get_existing_fingerprints(conn, account_id: int) -> set[str]:
-    """Load all existing execution fingerprints for an account.
-    Reads ticker from the trade row (not stored in executions JSON) to match execution_fingerprint format.
+def get_existing_fingerprints(conn, account_id: int) -> collections.Counter:
+    """How many times each execution fingerprint is already stored for an account.
+
+    A count, not a set: the question dedup asks is "how many of this fill do I
+    already have?", and each stored occurrence consumes one claim on the incoming
+    file. A set can only answer "have I seen this?", which drops every later
+    occurrence of an identical fill — so a second real fill in a statement that
+    also repeats an already-imported row vanishes, and the position never
+    balances. Reads ticker from the trade row (not stored in executions JSON) to
+    match execution_fingerprint format.
     """
     cursor = conn.execute(
         "SELECT ticker, executions FROM trades WHERE account_id = ?", (account_id,)
     )
-    fingerprints = set()
+    fingerprints = collections.Counter()
     for row in cursor:
         ticker = row[0] or ''
         try:
             execs = json.loads(row[1] or '[]')
             for e in execs:
                 fp = f"{e.get('date','')}|{e.get('time','')}|{ticker}|{e.get('action','')}|{e.get('qty','')}|{e.get('price','')}"
-                fingerprints.add(fp)
+                fingerprints[fp] += 1
         except Exception:
             pass
     return fingerprints
@@ -887,12 +919,20 @@ def build_trades_from_executions(all_executions: list[dict], account_id: int, co
 
     # DB-level dedup only — never dedupe within same file (Thinkorswim legitimately
     # emits identical time/price/qty fills for large split orders)
-    existing_fps = get_existing_fingerprints(conn, account_id) if conn else set()
+    existing_fps = get_existing_fingerprints(conn, account_id) if conn else collections.Counter()
+    # Two passes, because both directions of the count matter. Going one at a time
+    # would let the second identical row in *this* file be matched against the
+    # first row in *this* file and dropped, which is exactly the intra-file
+    # dedup this comment rules out. So: count what the file carries, then skip
+    # only the number the database already holds. File has N, DB has M -> N - M kept.
+    incoming_fps = collections.Counter(execution_fingerprint(e) for e in all_executions)
+    already_imported = {fp: existing_fps.get(fp, 0) for fp in incoming_fps}
     skipped = 0
     unique_executions = []
     for exec_dict in all_executions:
         fp = execution_fingerprint(exec_dict)
-        if fp in existing_fps:
+        if already_imported.get(fp, 0) > 0:
+            already_imported[fp] -= 1
             skipped += 1
         else:
             # Enrich with ticker/date for serialization
