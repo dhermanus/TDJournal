@@ -6,7 +6,7 @@ import tempfile
 import aiofiles
 from pathlib import Path
 from datetime import datetime, timedelta
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +23,7 @@ import database
 import attachments
 from csv_parser import (
     parse_broker_csv, parse_mt5_bars_csv, symbol_from_bar_filename, FUTURES_MULTIPLIERS,
+    detect_broker,
 )
 import excursions
 from ai_analysis import (
@@ -585,6 +586,266 @@ def _replace_regrouped_trades(conn, account_id: int, trades: list[dict]) -> None
             conn.execute("UPDATE trade_tags SET trade_group=? WHERE trade_group=?", (target, g))
 
 
+# How many trade_group names a preview ships in each list. The counts are what
+# the screen is built around; the names are so the user can spot-check a few,
+# and a 5,000-row statement must not put 5,000 strings through the UI.
+PREVIEW_LIST_CAP = 50
+
+
+def _persist_import(conn: sqlite3.Connection, account_id: int,
+                    trades: list[dict]) -> tuple[int, list[dict]]:
+    """Write parsed trades into `conn`. Returns (how many were written, failures).
+
+    Shared by the import and by the preview, deliberately: the preview replays
+    exactly this function against its copy, so the counts it reports come from
+    the same statements the real import runs. A second implementation of the
+    insert would drift, and the two would disagree about what an import does —
+    the one thing a preview must never do.
+
+    Per-trade failures are collected rather than raised: one malformed row must
+    not cost the rest of the file. A failure outside the loop rolls back, because
+    a half-written import is worse than none.
+    """
+    imported = 0
+    errors = []
+    try:
+        _replace_regrouped_trades(conn, account_id, trades)
+        for trade in trades:
+            try:
+                conn.execute("""
+                    INSERT INTO trades
+                        (account_id, trade_group, date, ticker, instrument_type, side,
+                         gross_pnl, net_pnl, commissions, executions,
+                         option_expiry, option_strike, option_type, source)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(trade_group, account_id) DO UPDATE SET
+                        date=excluded.date,
+                        side=excluded.side,
+                        gross_pnl=excluded.gross_pnl,
+                        net_pnl=excluded.net_pnl,
+                        commissions=excluded.commissions,
+                        executions=excluded.executions,
+                        imported_at=datetime('now')
+                """, (
+                    trade['account_id'], trade['trade_group'], trade['date'],
+                    trade['ticker'], trade['instrument_type'], trade['side'],
+                    trade['gross_pnl'], trade['net_pnl'], trade['commissions'],
+                    trade['executions'], trade['option_expiry'],
+                    trade['option_strike'], trade['option_type'], trade['source'],
+                ))
+                imported += 1
+            except Exception as e:
+                errors.append({"trade_group": trade.get('trade_group'), "error": str(e)})
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return imported, errors
+
+
+@contextmanager
+def _preview_database():
+    """A throwaway database holding a copy of the live journal, or raise.
+
+    A dry run has to run *somewhere*, because parsing is not read-only:
+    `build_trades_from_executions` updates stored rows and commits when new fills
+    land on an open option position — measured as 0.0/1 fill becoming 149.3/2
+    fills before the import returned a single trade to insert. A savepoint cannot
+    contain that, because the parser calls `conn.commit()` itself, and a commit
+    escapes the savepoint.
+
+    Copying can. It takes ~10ms for this journal and, unlike a backup taken
+    through the app's own connection, it succeeds while another connection holds
+    an open write transaction — the naive form hangs there (that probe timed out).
+    The source is opened `mode=ro` so taking the copy cannot take the write lock
+    and stall whatever the app is doing.
+    """
+    path = Path(database.DB_PATH).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Journal not found at {path}")
+    fd, dest = tempfile.mkstemp(suffix=".db", prefix="tdjournal-preview-")
+    os.close(fd)
+    # Both connections are closed before anything unlinks the file. If the parse
+    # raised and the preview connection were still open, the unlink would fail on
+    # Windows — where the file is locked until the last handle goes — and every
+    # failed preview would leak a temp database.
+    copy = None
+    preview = None
+    try:
+        source = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
+        copy = sqlite3.connect(dest)
+        try:
+            source.backup(copy)
+        finally:
+            source.close()
+        copy.close()
+        copy = None
+
+        preview = sqlite3.connect(dest)
+        preview.row_factory = sqlite3.Row
+        preview.execute("PRAGMA journal_mode=WAL")
+        preview.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield preview
+        finally:
+            preview.close()
+            preview = None
+    finally:
+        if preview is not None:
+            preview.close()
+        if copy is not None:
+            copy.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(dest + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _journal_trades(conn: sqlite3.Connection, account_id: int) -> dict:
+    """trade_group -> (date, side, gross, net, commissions, executions) for an account.
+
+    The key shape is deliberately `(date, executions)` plus the money: two
+    statements can produce identical P&L and still be different rows, so
+    comparing on P&L alone would call an update "unchanged".
+    """
+    rows = conn.execute(
+        "SELECT trade_group, date, side, gross_pnl, net_pnl, commissions, executions "
+        "FROM trades WHERE account_id=?", (account_id,))
+    return {r[0]: (r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows}
+
+
+def _classify_import(before: dict, after: dict, trades: list[dict]) -> dict:
+    """What happened to the journal across a parse, from the two snapshots.
+
+    Not from `trades`. An open option position whose fills arrive later is
+    rewritten *inside the parse* — measured as net_pnl 0.0/1 fill becoming
+    149.3/2 fills — and `build_trades_from_executions` then returns **zero**
+    trades, because the work was already done. Classifying only the returned
+    trades called that `imported: 0`, and a preview built on it reported
+    "nothing to do" for a file that rewrites a stored row.
+
+    Diffing the copy against the journal reads the same fact the import will
+    produce: a group only after is created, a group in both whose row changed is
+    updated, and a group only before is one `_replace_regrouped_trades` deleted.
+    """
+    created = sorted(set(after) - set(before))
+    updated = sorted(g for g in set(after) & set(before) if after[g] != before[g])
+    replaced = sorted(set(before) - set(after))
+    return {
+        "create": created,
+        "update": updated,
+        "replaced": replaced,
+        # The sum over `trades` still: rows changed by absorption carry no
+        # returned trade, and the preview's job is to report what will be added
+        # to the journal, which is exactly the parse's return value.
+        "net_pnl": round(sum(t.get("net_pnl") or 0 for t in trades), 2),
+    }
+
+
+@app.post("/api/import-csv/preview")
+async def import_csv_preview(
+    account_id: int = Form(...),
+    file: UploadFile = File(...),
+    broker: str = Form('auto'),
+    conn: sqlite3.Connection = Depends(get_connection),
+):
+    """Parse a statement and report what importing it would do, writing nothing.
+
+    Deliberately not a flag on /api/import-csv: the two have different failure
+    modes to prove, and a flag makes "dry run" one `true` away from "wrote the
+    journal" if someone misses it. This handler has no INSERT, UPDATE or DELETE
+    against the live connection at all.
+    """
+    if not file.filename.lower().endswith('.csv'):
+        raise ValueError("Only .csv files are accepted")
+
+    account = conn.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not account:
+        raise ValueError(f"Account {account_id} not found")
+
+    raw = await file.read()
+    try:
+        content = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        content = raw.decode('latin-1')
+
+    # Same MT5 timezone resolution as the real import: reading it must not be
+    # the thing that makes a preview disagree with the import it predicts.
+    tz_name = _mt5_timezone(conn)
+    line_errors: list[str] = []
+
+    # Before and after are snapshots: `before` is a SELECT against the journal
+    # (never a write), `after` the copy once parsing has run. The diff is the
+    # answer, because some of the work happens inside the parse and never shows
+    # up in the trades it returns.
+    before = _journal_trades(conn, account_id)
+    with _preview_database() as preview:
+        trades, skipped = parse_broker_csv(
+            content, broker, account_id, preview, tz_name=tz_name,
+            problems=line_errors,
+        )
+        # Replay the write step on the copy as well. Without it the diff would
+        # only ever see what the parse did on its own, and would report a file
+        # that merely returns trades as having changed nothing.
+        # Its written count is not the diff's: absorption lets the parse return
+        # zero trades while still changing a row, so the two answer different
+        # questions and must not be added together.
+        _, replay_errors = _persist_import(preview, account_id, trades)
+        after = _journal_trades(preview, account_id)
+    would = _classify_import(before, after, trades)
+
+    report = skipped if isinstance(skipped, dict) else None
+    skipped_deals = report.get("skipped_deals", skipped) if report else skipped
+    detect = detect_broker(content)
+    broker_key = (broker or 'auto').strip().lower()
+    if broker_key == 'auto':
+        broker_key = detect or ''
+
+    # Nothing to do means no row of the journal would be touched. Neither input
+    # decides this alone: `skipped` counts fills already imported, so a file
+    # imported twice has skipped > 0 and still does nothing, while `trades` can be
+    # empty for a file that rewrites a row through the absorption path.
+    nothing_to_do = not (would["create"] or would["update"] or would["replaced"])
+    if nothing_to_do:
+        message = "Nothing to import: every fill in this file is already in the journal."
+    else:
+        # These are trade *groups*, not fills — which is the unit both this
+        # screen and the import's own summary work in.
+        message = (
+            f"{len(would['create'])} new trade(s), {len(would['update'])} to update, "
+            f"{len(would['replaced'])} to replace"
+            + (f", {skipped_deals} fill(s) already imported" if skipped_deals else "")
+        )
+        if line_errors:
+            message += f"; {len(line_errors)} row(s) not imported"
+        if replay_errors:
+            # The write step failed on the copy, so it will fail the same way on
+            # the journal — worth saying before the user commits to it.
+            message += f"; {len(replay_errors)} trade(s) could not be written"
+
+    return {
+        # Cap the listing: a 5,000-row statement must not ship 5,000 names to
+        # render, and the counts above are what the screen is built around.
+        "create": would["create"][:PREVIEW_LIST_CAP],
+        "update": would["update"][:PREVIEW_LIST_CAP],
+        "replaced": would["replaced"][:PREVIEW_LIST_CAP],
+        "create_count": len(would["create"]),
+        "update_count": len(would["update"]),
+        "replaced_count": len(would["replaced"]),
+        "skipped": skipped_deals,
+        "write_errors": replay_errors,
+        "net_pnl": would["net_pnl"],
+        "line_errors": line_errors,
+        "broker": broker_key,
+        "detected_broker": detect,
+        "nothing_to_do": nothing_to_do,
+        "message": message,
+        "details": report,
+    }
+
+
 @app.post("/api/import-csv")
 async def import_csv(
     account_id: int = Form(...),
@@ -621,42 +882,7 @@ async def import_csv(
     report = skipped if isinstance(skipped, dict) else None
     skipped_deals = report.get("skipped_deals", skipped) if report else skipped
 
-    imported = 0
-    errors = []
-
-    try:
-        _replace_regrouped_trades(conn, account_id, trades)
-        for trade in trades:
-            try:
-                conn.execute("""
-                    INSERT INTO trades
-                        (account_id, trade_group, date, ticker, instrument_type, side,
-                         gross_pnl, net_pnl, commissions, executions,
-                         option_expiry, option_strike, option_type, source)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(trade_group, account_id) DO UPDATE SET
-                        date=excluded.date,
-                        side=excluded.side,
-                        gross_pnl=excluded.gross_pnl,
-                        net_pnl=excluded.net_pnl,
-                        commissions=excluded.commissions,
-                        executions=excluded.executions,
-                        imported_at=datetime('now')
-                """, (
-                    trade['account_id'], trade['trade_group'], trade['date'],
-                    trade['ticker'], trade['instrument_type'], trade['side'],
-                    trade['gross_pnl'], trade['net_pnl'], trade['commissions'],
-                    trade['executions'], trade['option_expiry'],
-                    trade['option_strike'], trade['option_type'], trade['source'],
-                ))
-                imported += 1
-            except Exception as e:
-                errors.append({"trade_group": trade.get('trade_group'), "error": str(e)})
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise
+    imported, errors = _persist_import(conn, account_id, trades)
 
     return {
         "imported": imported,
