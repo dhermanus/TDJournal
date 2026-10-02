@@ -90,7 +90,9 @@ Trade reconstruction, P&L, commissions, statistics, and other core trading calcu
   trade marked where you entered it, plus an AI coaching report graded on process rather than P&L.
   Each trade's grade carries the reason it was given. It is written once and kept: editing a trade
   or a diary note makes it stale so the review is regenerated, while an unchanged day is served
-  from the cache without a request. Every AI action shows its estimated token cost beneath it
+  from the cache without a request. Every AI action shows its estimated token cost beneath it.
+  A collapsible Weekly Summary sits under it for a cross-week read: the anchor mistake, the edge
+  that held, and one rule for the week ahead
 - **Brain**: a chat that answers questions about your trading history. It reads your journal
   through read-only query tools — totals, individual trades, breakdowns by strategy, symbol,
   weekday or day, and your diary — so every figure it quotes is computed by the app, not by

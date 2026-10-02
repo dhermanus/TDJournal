@@ -3,10 +3,10 @@ import {
   ChevronLeft, ChevronRight, RotateCcw, Calendar,
   AlertTriangle
 } from 'lucide-react';
-import { tradesApi, kpisApi, diaryApi, dailySummaryApi } from '../api';
+import { tradesApi, kpisApi, diaryApi, dailySummaryApi, weeklySummaryApi } from '../api';
 import { PageHeader, PanelHead } from './ui';
 import { usageLine } from './aiUsage';
-import { DayCurve, DayMeasures, Coaching, DayTrades } from '../v3/ReviewParts';
+import { DayCurve, DayMeasures, Coaching, DayTrades, WeeklySummary } from '../v3/ReviewParts';
 import {
   BarChart, Bar, XAxis, YAxis, ReferenceLine,
   Tooltip, ResponsiveContainer, Cell
@@ -72,6 +72,14 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
   const [summaryError, setSummaryError] = useState(null);
   const [regenerating, setRegenerating] = useState(false);
   const [cbDismissed, setCbDismissed] = useState(false);
+  // The weekly synthesis belongs to the week this day is in, so it is dropped
+  // when the day moves rather than left showing the previous week's answer.
+  const [weeklyOpen, setWeeklyOpen] = useState(false);
+  const [weekly, setWeekly] = useState(null);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [weeklyError, setWeeklyError] = useState(null);
+  const weeklySeqRef = useRef(0);
+  const weeklyPendingRef = useRef(null);
   const allTimeKpisRef = useRef(null);
 
   const today = new Date().toISOString().split('T')[0];
@@ -93,6 +101,13 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
     setSummaryLoading(true);
     setSummary(null);
     setCbDismissed(false);
+    // Discard an answer still in flight for the day we just left, so the card
+    // can never show last week's synthesis under this week's header.
+    weeklySeqRef.current += 1;
+    weeklyPendingRef.current = null;
+    setWeekly(null);
+    setWeeklyError(null);
+    setWeeklyLoading(false);
     try {
       const params = { date_from: d, date_to: d };
       if (accountId != null) params.account_id = accountId;
@@ -160,6 +175,52 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
       setSummaryLoading(false);
     }
   };
+
+  // Reading the week is on demand: the first open asks for it, re-opening a
+  // card that still holds its answer does not ask again, and moving to another
+  // day re-asks because that answer is about a different week. `force` is only
+  // ever the Regenerate button.
+  const fetchWeekly = useCallback(async (force = false) => {
+    // React StrictMode runs every effect twice in development, and a plain
+    // "am I open and empty" guard still asks twice — so the in-flight key is
+    // checked first, before anything is mutated. Ordering matters: bumping the
+    // sequence number before this return would leave the first request holding
+    // a stale seq and it would throw its own answer away.
+    const key = `${date}|${accountId ?? ''}`;
+    if (!force && weeklyPendingRef.current === key) return;
+    // Two Previous clicks in a row can leave an older week's answer in flight.
+    const seq = ++weeklySeqRef.current;
+    weeklyPendingRef.current = key;
+    setWeeklyLoading(true);
+    setWeeklyError(null);
+    try {
+      const params = { date, force };
+      if (accountId != null) params.account_id = accountId;
+      const res = await weeklySummaryApi.get(params);
+      if (seq !== weeklySeqRef.current) return;
+      // A body of `null` must still count as an answer: the effect decides
+      // "has it asked yet?" by `weekly == null`, so storing null straight from
+      // the response would ask again on every render, forever.
+      setWeekly(res.data || {});
+    } catch (e) {
+      if (seq !== weeklySeqRef.current) return;
+      // A refused feature (403) and a failed call both have to be readable in
+      // the card — the console is where this used to disappear.
+      console.error('Weekly summary failed', e);
+      setWeeklyError(e.response?.data?.detail || 'Could not load the weekly summary.');
+    } finally {
+      if (weeklyPendingRef.current === key) weeklyPendingRef.current = null;
+      if (seq === weeklySeqRef.current) setWeeklyLoading(false);
+    }
+  }, [date, accountId]);
+
+  // One effect handles the on-open request and a dropped answer (a new day).
+  // `weeklyError` is in the deps but guarded by `!weeklyError`, so a failure
+  // clears nothing: the retry path is the card's Try again button, and an
+  // unguarded retry against a 403 would spin forever.
+  useEffect(() => {
+    if (weeklyOpen && weekly == null && !weeklyError) fetchWeekly(false);
+  }, [weeklyOpen, weekly, weeklyError, fetchWeekly]);
 
   // Consecutive losing trades from end of today's list
   const consecutiveLosses = (() => {
@@ -263,6 +324,18 @@ export default function DailySummary({ accountId, date, onDateChange, onOpenDeta
               </div>
             )}
           </section>
+
+          {/* The week this day sits in: same voice, one level up */}
+          <WeeklySummary
+            open={weeklyOpen}
+            loading={weeklyLoading}
+            data={weekly}
+            error={weeklyError}
+            usage={weekly?.ai_usage}
+            onToggle={() => setWeeklyOpen(o => !o)}
+            onRegenerate={() => fetchWeekly(true)}
+            onRetry={() => fetchWeekly(false)}
+          />
 
           {/* The trades */}
           <section className="card panel-flush">

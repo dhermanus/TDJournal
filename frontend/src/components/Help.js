@@ -218,7 +218,7 @@ const FEATURES = [
     tips: [
       'Generated on demand, cached after the first generation.',
       'Best run at the end of the trading week (Friday) to capture the full picture.',
-      'Use "Force regenerate" to get a fresh analysis if you logged more trades or diary entries.',
+      'Use "Regenerate" to get a fresh analysis if you logged more trades or diary entries.',
     ],
   },
   {

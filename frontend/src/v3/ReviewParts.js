@@ -1,6 +1,9 @@
 /* Review page pieces in the V3 language. Presentation only. */
 import { useState, useMemo } from 'react';
+import { Brain, ChevronUp, ChevronDown, RotateCcw } from 'lucide-react';
 import { Measures, Tabs, Grade, money, money2, tone } from './parts';
+import { readResult, rangeLabel } from '../components/weeklySummary';
+import { usageLine } from '../components/aiUsage';
 
 /* the clock every trading session runs on */
 const OPEN = 9.5;
@@ -310,6 +313,111 @@ export function Coaching({ summary, loading, onRegenerate }) {
         )}
       </div>
     </>
+  );
+}
+
+/* ── the week behind that day ──────────────────────────────────────────────
+   Collapsed until asked for: opening it is the request, and a second open
+   re-reads what is already held rather than paying for it again.        */
+export function WeeklySummary({ open, loading, data, error, usage, onToggle, onRegenerate, onRetry }) {
+  const panelId = 'weekly-summary-panel';
+  const result = readResult(data);
+  const range = rangeLabel(result);
+
+  return (
+    <section className="card">
+      <div className="panel-head">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={open}
+          aria-controls={open ? panelId : undefined}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+            background: 'none', border: 0, padding: 0, cursor: 'pointer',
+            color: 'var(--text-primary)', textAlign: 'left',
+          }}
+        >
+          <Brain size={16} color="var(--accent-line)" aria-hidden="true" />
+          {/* h2 + div, not spans: `.section-title` and `.section-sub` are block
+              styles, and as inline spans they collapse onto one line. `flex: 1`
+              puts the chevron at the card edge, as the other panels do. */}
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <span className="section-title" style={{ display: 'block' }}>Weekly Summary</span>
+            <span className="section-sub" style={{ display: 'block' }}>
+              {range || 'The trading week this day belongs to'}
+            </span>
+          </span>
+          {open
+            ? <ChevronUp size={16} color="var(--text-tertiary)" aria-hidden="true" />
+            : <ChevronDown size={16} color="var(--text-tertiary)" aria-hidden="true" />}
+        </button>
+      </div>
+
+      {open && (
+        <div id={panelId} style={{ marginTop: 4 }}>
+          {error && (
+            <div className="notice neg" role="alert" style={{ marginBottom: 14 }}>
+              {error}
+            </div>
+          )}
+
+          {loading ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div className="skeleton" style={{ height: 12 }} />
+              <div className="skeleton" style={{ height: 12, width: '85%' }} />
+              <div className="skeleton" style={{ height: 12, width: '70%' }} />
+              <div className="v3-read" style={{ marginTop: 4 }}>Reading the week…</div>
+            </div>
+          ) : result.kind === 'summary' ? (
+            <>
+              <div className="v3-cols">
+                <p className="v3-narr">{result.narrative}</p>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
+                {result.blocks.map((b) => (
+                  // `.notice` is display:flex, so its children become row items
+                  // — the label and the text need their own column.
+                  <div key={b.key} className={b.tone === 'rule' ? 'notice accent' : undefined}
+                       style={b.tone === 'rule' ? { display: 'flex', flexDirection: 'column', gap: 5 } : undefined}>
+                    <div className="v3-lab">{b.label}</div>
+                    <div style={{
+                      fontSize: 13, lineHeight: 1.55,
+                      color: b.tone === 'rule' ? 'var(--text)' : 'var(--text-secondary)',
+                    }}>{b.text}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={onRegenerate}>
+                  <RotateCcw size={12} aria-hidden="true" /> Regenerate
+                </button>
+                {usageLine(usage) && (
+                  <span
+                    className="v3-read"
+                    role="status"
+                    aria-label="AI token usage"
+                  >{usageLine(usage)}</span>
+                )}
+              </div>
+            </>
+          ) : result.kind === 'refusal' ? (
+            // The endpoint's own answer to "there is nothing to summarise".
+            <div className="v3-empty">{result.message}</div>
+          ) : error ? (
+            // `weekly` is still null here, so closing and reopening would retry —
+            // but that is not a thing anyone would think to try.
+            <button type="button" className="btn btn-secondary btn-sm" onClick={onRetry}>
+              Try again
+            </button>
+          ) : (
+            <div className="v3-empty">No weekly synthesis yet.</div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
