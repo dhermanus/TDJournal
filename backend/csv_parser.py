@@ -198,6 +198,27 @@ def clean_amount(value: str) -> float:
         return 0.0
 
 
+class CsvRow(list):
+    """A parsed CSV row that remembers which line of the file it came from.
+
+    It is a list, so every column lookup, slice and `len()` the section parsers
+    already do keeps working unchanged. `line` is 1-based over the original
+    content, and is what lets a row that had to be dropped report itself as
+    `line 47: ...` instead of vanishing silently.
+    """
+
+    __slots__ = ('line',)
+
+    def __init__(self, cells, line=0):
+        super().__init__(cells)
+        self.line = line
+
+
+def _line_of(row) -> int:
+    """Source line of a row, 0 when the caller built it without one."""
+    return getattr(row, 'line', 0) or 0
+
+
 def split_csv_sections(content: str) -> dict[str, list[list[str]]]:
     """
     Split Thinkorswim CSV into named sections.
@@ -254,7 +275,11 @@ def split_csv_sections(content: str) -> dict[str, list[list[str]]]:
         try:
             reader = csv.reader(io.StringIO(line))
             row = next(reader)
-            current_rows.append(row)
+            # i is the index within splitlines(), so i + 1 is the 1-based line in
+            # the file. This splitter already reads one physical line per record
+            # (a quoted field spanning lines cannot survive it), so the number it
+            # attaches is the one a user sees in their editor.
+            current_rows.append(CsvRow(row, i + 1))
         except Exception:
             pass
         i += 1
@@ -304,14 +329,19 @@ def _parse_trade_history_expiry(exp_str: str) -> str | None:
     return f"{year:04d}-{month:02d}-{int(day):02d}"
 
 
-def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
+def parse_trade_history_section(rows: list[list[str]], problems: list | None = None) -> list[dict]:
     """
     Parse Account Trade History section.
     Header: ,Exec Time,Spread,Side,Qty,Pos Effect,Symbol,Exp,Strike,Type,Price,Net Price,Order Type
     Returns executions with computed amounts (price × qty × multiplier).
+
+    A row that cannot be used is appended to `problems` as `line N: reason`
+    rather than dropped without a word. The section's rows carry their source
+    line (see CsvRow), so the number matches what the user sees in their editor.
     """
     if not rows:
         return []
+    notes = problems if problems is not None else []
 
     header_idx = None
     for i, row in enumerate(rows):
@@ -328,16 +358,24 @@ def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
 
     executions = []
     for row in rows[header_idx + 1:]:
+        line = _line_of(row)
+        # A subtotals or summary line carries no time and is not a fill; report
+        # it only when the row also looks like it was meant to be one.
         if len(row) < 7:
+            if any(str(c).strip() for c in row):
+                notes.append(f"line {line}: fewer than 7 columns, so it is not a trade row")
             continue
 
         exec_time_str = row[col.get('EXEC TIME', 1)].strip() if col.get('EXEC TIME', 1) < len(row) else ''
         if not exec_time_str or ' ' not in exec_time_str:
+            if exec_time_str or any(str(row[k]).strip() for k in (3, 4, 6) if k < len(row)):
+                notes.append(f"line {line}: Exec Time must be 'YYYY-MM-DD HH:MM:SS', got {exec_time_str or 'nothing'}")
             continue
         date_part, time_part = exec_time_str.split(' ', 1)
 
         side_str = row[col.get('SIDE', 3)].strip().upper() if col.get('SIDE', 3) < len(row) else ''
         if side_str not in ('BUY', 'SELL'):
+            notes.append(f"line {line}: Side must be BUY or SELL, got {side_str or 'nothing'}")
             continue
         action = 'BOT' if side_str == 'BUY' else 'SOLD'
 
@@ -345,12 +383,15 @@ def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
         try:
             qty = abs(int(qty_str))
         except ValueError:
+            notes.append(f"line {line}: Qty is not a whole number, got {qty_str!r}")
             continue
         if qty == 0:
+            notes.append(f"line {line}: Qty is zero, so this is not a fill")
             continue
 
         symbol = row[col.get('SYMBOL', 6)].strip().upper() if col.get('SYMBOL', 6) < len(row) else ''
         if not symbol:
+            notes.append(f"line {line}: Symbol is empty")
             continue
 
         exp_str    = row[col.get('EXP', 7)].strip()    if col.get('EXP', 7)    < len(row) else ''
@@ -364,6 +405,7 @@ def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
             # so the cross-section dedup against Cash Balance matches correctly.
             price = abs(float(price_str))
         except ValueError:
+            notes.append(f"line {line}: Price is not a number, got {price_str!r}")
             continue
 
         iso_date = normalize_date(date_part)
@@ -388,6 +430,10 @@ def parse_trade_history_section(rows: list[list[str]]) -> list[dict]:
             option_type = None
             multiplier = _point_value(symbol, 'FUTURE')
             if multiplier is None:
+                notes.append(
+                    f"line {line}: {symbol} has no known point value, so its P&L "
+                    "cannot be priced without guessing"
+                )
                 continue
         else:
             instrument_type = 'STOCK'
@@ -472,14 +518,21 @@ def aggregate_executions(fills: list[dict]) -> dict:
     }
 
 
-def parse_cash_balance_section(rows: list[list[str]], date_filter: str | None = None) -> list[dict]:
+def parse_cash_balance_section(rows: list[list[str]], date_filter: str | None = None,
+                               problems: list | None = None) -> list[dict]:
     """
     Parse rows from the Cash Balance section.
     Expects header: DATE,TIME,TYPE,REF #,DESCRIPTION,Misc Fees,Commissions & Fees,AMOUNT,BALANCE
     Returns list of execution dicts.
+
+    Only *trade* rows are reported when dropped: a statement's Cash Balance also
+    carries fees, deposits and transfers, and those are skipped by design, not
+    lost. A row marked TRD whose description cannot be read is a trade the user
+    expected to import, so it goes into `problems` as `line N: reason`.
     """
     if not rows:
         return []
+    notes = problems if problems is not None else []
 
     # Find header row
     header_idx = None
@@ -500,7 +553,12 @@ def parse_cash_balance_section(rows: list[list[str]], date_filter: str | None = 
 
     executions = []
     for row in rows[header_idx + 1:]:
+        line = _line_of(row)
         if len(row) < 5:
+            # Short rows are how Excel pads or truncates an export; only worth
+            # saying something when the row claims to be a trade.
+            if any('TRD' == str(c).strip() for c in row):
+                notes.append(f"line {line}: trade row has fewer than 5 columns")
             continue
 
         row_type = row[col.get('TYPE', 2)].strip() if col.get('TYPE', 2) < len(row) else ''
@@ -528,6 +586,10 @@ def parse_cash_balance_section(rows: list[list[str]], date_filter: str | None = 
 
         parsed = parse_cash_description(desc)
         if not parsed:
+            # The one drop in this section that loses a trade: a TRD row whose
+            # description no parser recognised. Everything else a statement
+            # carries is skipped on purpose.
+            notes.append(f"line {line}: trade description not understood: {desc[:70]!r}")
             continue
 
         parsed.update({
@@ -543,13 +605,16 @@ def parse_cash_balance_section(rows: list[list[str]], date_filter: str | None = 
     return executions
 
 
-def parse_futures_section_rows(rows: list[list[str]]) -> list[dict]:
+def parse_futures_section_rows(rows: list[list[str]], problems: list | None = None) -> list[dict]:
     """
     Parse rows from the Futures Statements section.
     Header: Trade Date,Exec Date,Exec Time,Type,Ref #,Description,Misc Fees,Commissions & Fees,Amount,Balance
+
+    Same rule as Cash Balance: only TRD rows that cannot be read are reported.
     """
     if not rows:
         return []
+    notes = problems if problems is not None else []
 
     header_idx = None
     for i, row in enumerate(rows):
@@ -566,7 +631,10 @@ def parse_futures_section_rows(rows: list[list[str]]) -> list[dict]:
 
     executions = []
     for row in rows[header_idx + 1:]:
+        line = _line_of(row)
         if len(row) < 5:
+            if any(str(c).strip() in ('TRD', 'TRADE') for c in row):
+                notes.append(f"line {line}: trade row has fewer than 5 columns")
             continue
 
         row_type = row[col.get('TYPE', 3)].strip() if col.get('TYPE', 3) < len(row) else ''
@@ -588,6 +656,7 @@ def parse_futures_section_rows(rows: list[list[str]]) -> list[dict]:
 
         parsed = parse_futures_description(desc)
         if not parsed:
+            notes.append(f"line {line}: futures description not understood: {desc[:70]!r}")
             continue
 
         parsed.update({
@@ -864,10 +933,15 @@ def _cross_section_key(ex: dict) -> str:
     return f"{ex.get('iso_date','')}|{ex.get('ticker','')}|{ex.get('action','')}|{ex.get('qty','')}|{ex.get('price','')}"
 
 
-def parse_thinkorswim_csv(content: str, account_id: int, conn=None) -> tuple[list[dict], int]:
+def parse_thinkorswim_csv(content: str, account_id: int, conn=None,
+                          problems: list | None = None) -> tuple[list[dict], int]:
     """
     Full CSV parse pipeline.
     Returns (list of trade dicts ready for DB insert, skipped_count).
+
+    `problems` collects `line N: reason` for every trade row that could not be
+    read. This parser's sections used to `continue` past such rows with no
+    output at all, so a statement could lose a fill and still report success.
     """
     content = content.lstrip('﻿')
 
@@ -878,9 +952,9 @@ def parse_thinkorswim_csv(content: str, account_id: int, conn=None) -> tuple[lis
 
     all_executions = []
     if cash_rows:
-        all_executions.extend(parse_cash_balance_section(cash_rows))
+        all_executions.extend(parse_cash_balance_section(cash_rows, problems=problems))
     if futures_rows:
-        all_executions.extend(parse_futures_section_rows(futures_rows))
+        all_executions.extend(parse_futures_section_rows(futures_rows, problems=problems))
 
     # Merge Trade History: add fills not already represented in Cash Balance / Futures.
     # Use (iso_date, ticker, action, qty, price) to match across sections — time formats differ.
@@ -892,13 +966,19 @@ def parse_thinkorswim_csv(content: str, account_id: int, conn=None) -> tuple[lis
         for ex in all_executions:
             k = (ex.get('iso_date', ''), ex.get('ticker', ''), ex.get('action', ''), ex.get('price', 0.0))
             cb_qty_map[k] = cb_qty_map.get(k, 0) + ex.get('qty', 0)
-        for ex in parse_trade_history_section(trade_history_rows):
+        # Collected separately: a Trade History row dropped because Cash Balance
+        # already carries that fill is a *successful* dedup, not a lost trade,
+        # and must not be reported as one.
+        th_notes: list[str] = []
+        for ex in parse_trade_history_section(trade_history_rows, problems=th_notes):
             if _cross_section_key(ex) in cb_exact_keys:
                 continue
             k = (ex.get('iso_date', ''), ex.get('ticker', ''), ex.get('action', ''), ex.get('price', 0.0))
             if cb_qty_map.get(k, 0) >= ex.get('qty', 0):
                 continue  # CB partial fills already cover this aggregated TH fill
             all_executions.append(ex)
+        if problems is not None:
+            problems.extend(th_notes)
 
     return build_trades_from_executions(all_executions, account_id, conn)
 
@@ -1073,6 +1153,10 @@ def split_ibkr_sections(content: str) -> dict[str, list[dict[str, str]]]:
                 continue
             values = row[2:]
             record = {h: (values[i].strip() if i < len(values) else '') for i, h in enumerate(header)}
+            # reader.line_num is the physical line this record ended on — right
+            # for a statement whose quoted fields span lines, which is why this
+            # one reads the counter off the reader instead of counting rows.
+            record['_line'] = reader.line_num
             sections.setdefault(section, []).append(record)
         # SubTotal / Total / Notes rows are summaries, not fills: skip them.
 
@@ -1158,7 +1242,7 @@ def _ibkr_datetime(value: str) -> tuple[str, str] | None:
     return date_part, time_part.strip()
 
 
-def parse_ibkr_trades_section(records: list[dict[str, str]]) -> list[dict]:
+def parse_ibkr_trades_section(records: list[dict[str, str]], problems: list | None = None) -> list[dict]:
     """
     Turn the Trades section of an IBKR Activity Statement into execution dicts.
     IBKR emits one row per order by default (DataDiscriminator 'Order'); when a
@@ -1166,34 +1250,56 @@ def parse_ibkr_trades_section(records: list[dict[str, str]]) -> list[dict]:
     and some layouts include both. If both are present only the 'Trade' rows
     (the real fills) are used so nothing is counted twice. 'ClosedLot' rows are
     tax-lot detail and always skipped.
+
+    Rows that *are* fills but cannot be read go into `problems` with the line
+    number the splitter recorded. Rows skipped by design — the other
+    DataDiscriminator, and asset classes this journal does not track (forex,
+    bonds, CFDs, cash) — are not reported, because nothing was lost by them.
     """
     if not records:
         return []
+    notes = problems if problems is not None else []
 
     kinds = {r.get('DataDiscriminator', '').strip() for r in records}
     use_kind = 'Trade' if 'Trade' in kinds else 'Order'
 
     executions = []
+    skipped_category: dict[str, list[int]] = {}
     for r in records:
         if r.get('DataDiscriminator', '').strip() != use_kind:
             continue
 
+        line = r.get('_line', 0)
         instrument_type = _ibkr_instrument_type(r.get('Asset Category', ''))
         if not instrument_type:
+            # Not a loss: Cash rows are balance movements, not fills. Forex, CFD
+            # and bond rows *are* fills this parser does not yet handle, so say
+            # so rather than lose them silently — the journal's own FX trades
+            # come from MT5, where they are parsed with their own rules. They are
+            # counted here and summarised after the loop: one note per category,
+            # not fifty-six identical ones.
+            category = r.get('Asset Category', '').strip()
+            cat_lower = category.lower()
+            if category and not cat_lower.startswith(('cash', 'informational')):
+                skipped_category.setdefault(category, []).append(line)
             continue
 
         symbol = r.get('Symbol', '').strip().upper()
         if not symbol:
+            notes.append(f"line {line}: Symbol is empty")
             continue
 
         qty = _ibkr_qty(r.get('Quantity', ''))
         if qty is None:
+            notes.append(f"line {line}: Quantity {r.get('Quantity', '')!r} is empty, zero or not a number")
             continue
         signed = r.get('Quantity', '').strip().replace(',', '')
         action = 'SOLD' if signed.startswith('-') else 'BOT'
 
         dt = _ibkr_datetime(r.get('Date/Time', '') or r.get('Date', ''))
         if not dt:
+            raw_dt = (r.get('Date/Time', '') or r.get('Date', '')).strip()
+            notes.append(f"line {line}: date {raw_dt!r} is not YYYY-MM-DD")
             continue
         iso_date, time_part = dt
 
@@ -1206,6 +1312,7 @@ def parse_ibkr_trades_section(records: list[dict[str, str]]) -> list[dict]:
         if instrument_type == 'OPTION':
             parsed = parse_ibkr_option_symbol(symbol)
             if not parsed:
+                notes.append(f"line {line}: option symbol {symbol!r} is not a format this parser reads")
                 continue
             ticker = parsed['ticker']
             option_expiry = parsed['option_expiry']
@@ -1242,14 +1349,26 @@ def parse_ibkr_trades_section(records: list[dict[str, str]]) -> list[dict]:
             'raw_description': f"{action} {qty} {symbol} @{price}",
         })
 
+    # One line per category rather than one per row: a statement can carry
+    # dozens of forex fills, and fifty-six identical notes would bury the ones
+    # that matter.
+    for category, lines in skipped_category.items():
+        first = f"line {lines[0]}" if len(lines) == 1 else f"{len(lines)} rows, starting line {lines[0]}"
+        notes.append(
+            f"{category} fills are not imported by the IBKR parser yet: "
+            f"{first} to line {lines[-1]}"
+        )
+
     return executions
 
 
-def parse_ibkr_csv(content: str, account_id: int, conn=None) -> tuple[list[dict], int]:
+def parse_ibkr_csv(content: str, account_id: int, conn=None,
+                   problems: list | None = None) -> tuple[list[dict], int]:
     """
     IBKR Activity Statement CSV parse pipeline (Client Portal -> Performance &
     Reports -> Statements -> Activity -> CSV). Same output contract as
     parse_thinkorswim_csv: (trade dicts ready for DB insert, skipped_count).
+    `problems` collects `line N: reason` for fills that could not be read.
     """
     content = content.lstrip('﻿')
     sections = split_ibkr_sections(content)
@@ -1261,7 +1380,7 @@ def parse_ibkr_csv(content: str, account_id: int, conn=None) -> tuple[list[dict]
             "with the Trades section enabled."
         )
 
-    executions = parse_ibkr_trades_section(trade_records)
+    executions = parse_ibkr_trades_section(trade_records, problems=problems)
     return build_trades_from_executions(executions, account_id, conn)
 
 
@@ -2031,6 +2150,11 @@ BROKER_PARSERS = {
     'mt5': parse_mt5_csv,
 }
 
+# Parsers that report a dropped row instead of raising on it, so a caller asking
+# for `problems` only hears from these two. The other two stop the import and
+# name the line themselves.
+_COLLECTING_PARSERS = {'thinkorswim', 'ibkr'}
+
 BROKER_LABELS = {
     'thinkorswim': 'Thinkorswim',
     'ibkr': 'Interactive Brokers',
@@ -2100,4 +2224,11 @@ def parse_broker_csv(content: str, broker: str, account_id: int, conn=None,
     parser = BROKER_PARSERS[key]
     if key == 'mt5':
         return parser(content, account_id, conn, tz_name=kwargs.get('tz_name'))
+
+    # Only these two *collect* dropped rows. The generic template and MT5 refuse
+    # the whole file instead, naming the line in the ValueError they raise, so
+    # handing them a collector would promise a summary that never arrives.
+    problems = kwargs.get('problems')
+    if key in _COLLECTING_PARSERS and problems is not None:
+        return parser(content, account_id, conn, problems=problems)
     return parser(content, account_id, conn)

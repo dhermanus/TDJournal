@@ -608,8 +608,15 @@ async def import_csv(
     # MT5 timestamps are broker-server local time; every other parser writes
     # dates the file already states. Resolved here so the timezone setting is
     # read from the same connection the import writes through.
+    # `line_errors` collects trade rows that could not be read. Without it the
+    # Thinkorswim and IBKR sections dropped such rows on `continue` and the
+    # import still reported success — a statement could lose a fill and nothing
+    # said so. The generic template and MT5 refuse the whole file instead, so
+    # they add nothing here.
+    line_errors: list[str] = []
     trades, skipped = parse_broker_csv(
-        content, broker, account_id, conn, tz_name=_mt5_timezone(conn)
+        content, broker, account_id, conn, tz_name=_mt5_timezone(conn),
+        problems=line_errors,
     )
     report = skipped if isinstance(skipped, dict) else None
     skipped_deals = report.get("skipped_deals", skipped) if report else skipped
@@ -655,6 +662,7 @@ async def import_csv(
         "imported": imported,
         "skipped": skipped_deals,
         "errors": errors,
+        "line_errors": line_errors,
         "message": (
             f"Imported {imported} MT5 position(s). "
             f"Skipped {skipped_deals} previously imported deal(s). "
@@ -663,6 +671,8 @@ async def import_csv(
             if report else
             f"Imported {imported} trade group(s). "
             f"Skipped {skipped_deals} duplicate execution(s)."
+            + (f" {len(line_errors)} row(s) in the file were not imported."
+               if line_errors else "")
         ),
         "details": report,
     }
