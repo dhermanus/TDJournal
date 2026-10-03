@@ -488,6 +488,10 @@ test('Import keeps broker CSV import and diary analysis, with keyboard dropzones
   const dropzones = screen.getAllByRole('button', { name: /Press Enter to browse/ });
   expect(dropzones).toHaveLength(3);
   dropzones.forEach(z => expect(z).toHaveAttribute('tabindex', '0'));
+  // CSV imports are now two-step: parsing reports what would happen before the
+  // user commits to anything, so there is no eager one-click import button.
+  expect(screen.getByRole('button', { name: /Preview Import/ })).toBeDisabled();
+  expect(screen.queryByRole('button', { name: /^Import Trades$/ })).not.toBeInTheDocument();
 });
 
 test('Import offers a bar dropzone alongside the deal and diary ones', async () => {

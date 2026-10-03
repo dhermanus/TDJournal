@@ -50,6 +50,9 @@ export const attachmentsApi = {
 };
 
 export const importApi = {
+  previewCsv: (formData) => api.post('/api/import-csv/preview', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
   importCsv: (formData) => api.post('/api/import-csv', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
@@ -59,6 +62,8 @@ export const importApi = {
   uploadDiary: (formData) => api.post('/api/upload-diary', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
+  batches: (accountId) => api.get('/api/import-batches', { params: { account_id: accountId } }),
+  undoBatch: (batchId) => api.post(`/api/import-batches/${batchId}/undo`),
 };
 
 export const kpisApi = {

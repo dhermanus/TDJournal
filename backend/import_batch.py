@@ -22,6 +22,8 @@ are separate workflows, not written by a CSV import, and are left alone.
 import json
 import sqlite3
 
+from attachments import attachment_path
+
 
 SNAPSHOT_TABLES = (
     # (key in the snapshot, table) — every one of them joins on trade_group.
@@ -151,6 +153,31 @@ def _insert(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[di
     )
 
 
+def unlink_attachments(upload_dir: str | None, stored_names) -> int:
+    """Remove attachment files whose rows are about to be gone.
+
+    Resolved through `attachments.attachment_path`, which re-checks containment,
+    so a name that somehow reached this point cannot write outside the uploads
+    folder. Returns how many were removed; a file already missing is not a
+    failure — the row is what matters and it has been dealt with.
+    """
+    if not upload_dir:
+        return 0
+    removed = 0
+    for name in stored_names:
+        if not name:
+            continue
+        try:
+            attachment_path(upload_dir, name).unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            # Includes a locked file on Windows. Undo has already committed, so
+            # a file that cannot go yet is a leftover to clean up by hand, not a
+            # reason to fail the call and tell the user it never happened.
+            continue
+    return removed
+
+
 def record(conn: sqlite3.Connection, account_id: int, *, filename: str, broker: str,
            snapshot: dict, imported: int, skipped: int, line_error_count: int,
            write_error_count: int, changed: bool) -> int | None:
@@ -202,7 +229,7 @@ def list_batches(conn: sqlite3.Connection, account_id: int, limit: int = 20) -> 
     ]
 
 
-def undo(conn: sqlite3.Connection, batch_id: int) -> dict:
+def undo(conn: sqlite3.Connection, batch_id: int, upload_dir: str | None = None) -> dict:
     """Restore the journal to its pre-import state. Idempotent by refusal.
 
     Two rules keep this from making things worse than not undoing:
@@ -242,6 +269,12 @@ def undo(conn: sqlite3.Connection, batch_id: int) -> dict:
         raise ValueError("That batch has no usable snapshot.")
     groups: list[str] = snapshot.get("groups") or []
 
+    # Attachment files must follow their rows. `attachments.remove_for_trade`
+    # deletes the file after the row for exactly this reason, and `dormant-defects.md`
+    # tracks the case where rows are moved without their files. Deleting a row and
+    # leaving its file is the mirror image: rows gone, 40MB of images still on disk
+    # with nothing pointing at them.
+    orphans: list[str] = []
     try:
         # 1. Remove everything the import wrote, keyed to the groups it touched.
         # `trades` is scoped to the account: trade_group is only unique *per
@@ -249,6 +282,7 @@ def undo(conn: sqlite3.Connection, batch_id: int) -> dict:
         # that happened to share a name. The other three tables have no account
         # column at all and are keyed on trade_group alone — the same choice
         # `_replace_regrouped_trades` makes when it moves them.
+        saved_names = {r.get("stored_name") for r in (snapshot.get("attachments") or [])}
         for group in groups:
             conn.execute(
                 "DELETE FROM trades WHERE trade_group = ? AND account_id = ?",
@@ -256,6 +290,15 @@ def undo(conn: sqlite3.Connection, batch_id: int) -> dict:
             for key, table in SNAPSHOT_TABLES:
                 if table == "trades":
                     continue
+                if table == "trade_attachments":
+                    # Anything not in the snapshot was added after the import and
+                    # is about to disappear with its row.
+                    orphans.extend(
+                        r["stored_name"] for r in conn.execute(
+                            "SELECT stored_name FROM trade_attachments WHERE trade_group = ?",
+                            (group,)).fetchall()
+                        if r[0] not in saved_names
+                    )
                 conn.execute(f"DELETE FROM {table} WHERE trade_group = ?", (group,))
 
         # 2. Put back what was there before.
@@ -275,6 +318,10 @@ def undo(conn: sqlite3.Connection, batch_id: int) -> dict:
     except Exception:
         conn.rollback()
         raise
+
+    # Only after the commit: a file deleted first and a transaction that then
+    # rolled back would take an attachment the journal still refers to.
+    unlink_attachments(upload_dir, orphans)
 
     restored = sum(len(snapshot.get(key) or []) for key, _ in SNAPSHOT_TABLES)
     return {

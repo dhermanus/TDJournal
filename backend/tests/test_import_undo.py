@@ -46,12 +46,19 @@ OPT_GROUP = "9/14/26_AAPL_OPTION_2026-05-15_190_CALL_1"
 def client(tmp_path, monkeypatch):
     import sqlite3
     db = tmp_path / "journal.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
     monkeypatch.setenv("DATABASE_PATH", str(db))
+    # Undo unlinks attachment files through UPLOAD_DIR. Left unset it resolves to
+    # the repo's own uploads folder, so a test fixture writing a file named here
+    # would be writing — and later deleting — inside backend/uploads.
+    monkeypatch.setenv("UPLOAD_DIR", str(uploads))
     for name in ("database", "main"):
         sys.modules.pop(name, None)
     import database
     database.DB_PATH = str(db)
     import main
+    assert str(main.UPLOAD_DIR) == str(uploads), main.UPLOAD_DIR
     from fastapi.testclient import TestClient
     with TestClient(main.app) as c:
         conn = sqlite3.connect(str(db))
@@ -59,6 +66,7 @@ def client(tmp_path, monkeypatch):
         conn.commit()
         conn.close()
         c.db = str(db)
+        c.upload_dir = uploads
         yield c
 
 
@@ -233,6 +241,68 @@ def test_undo_removes_analysis_tags_and_attachments_written_after_the_import(cli
     conn.close()
     assert left == [0, 0, 0], f"nothing may survive the trade it belongs to: {left}"
     assert row(client) is None
+
+
+def test_undo_deletes_the_attachment_files_whose_rows_it_removes(client):
+    """A row gone with its file left behind is an orphan in the other direction.
+
+    `attachments.remove_for_trade` deletes the file after the row for exactly
+    this reason, and docs/dormant-defects.md tracks the sibling case where rows
+    move without their files.
+    """
+    import sqlite3
+    from attachments import attachment_path
+    do_import(client, STMT)
+    batch_id = batches(client)[0]["id"]
+
+    # attachment_path is where the file really lives (uploads/trade_attachments),
+    # and it is the same helper undo uses to unlink it.
+    stored = attachment_path(str(client.upload_dir), "abc123.png")
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(b"\x89PNG\r\n\x1a\n")
+    conn = sqlite3.connect(client.db)
+    conn.execute(
+        "INSERT INTO trade_attachments (trade_group, original_name, stored_name, size_bytes) "
+        "VALUES (?,?,?,?)",
+        (GROUP, "chart.png", "abc123.png", 16))
+    conn.commit()
+    conn.close()
+    assert stored.exists()
+
+    r = undo(client, batch_id)
+    assert r.status_code == 200, r.text
+    assert not stored.exists(), "the file outlived its row and its trade"
+
+
+def test_undo_keeps_the_attachment_file_the_snapshot_will_restore(client):
+    """The counterpart: a file that was there before the import stays there.
+
+    The snapshot carries the row, so undo re-inserts it — deleting its file
+    first would restore a row pointing at a download that 404s.
+    """
+    import sqlite3
+    do_import(client, PARTIAL)          # creates the group with one fill
+    stored = client.upload_dir / "kept.png"
+    stored.write_bytes(b"\x89PNG\r\n\x1a\n")
+    conn = sqlite3.connect(client.db)
+    conn.execute(
+        "INSERT INTO trade_attachments (trade_group, original_name, stored_name, size_bytes) "
+        "VALUES (?,?,?,?)",
+        (GROUP, "plan.png", "kept.png", 16))
+    conn.commit()
+    conn.close()
+
+    do_import(client, STMT)             # extends it, taking a snapshot that
+    batch_id = batches(client)[0]["id"]  # includes the attachment row
+    r = undo(client, batch_id)
+    assert r.status_code == 200, r.text
+    conn = sqlite3.connect(client.db)
+    left = conn.execute(
+        "SELECT COUNT(*) FROM trade_attachments WHERE trade_group=?", (GROUP,)).fetchone()[0]
+    conn.close()
+    assert left == 1, "the snapshotted attachment row must be restored"
+    assert stored.exists(), "and its file must still be there to download"
+    assert row(client)["fills"] == 1
 
 
 def test_undo_does_not_delete_rows_of_a_trade_it_left_alone(client):

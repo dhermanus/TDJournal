@@ -969,7 +969,7 @@ def undo_import(
     a later import sits on top of it, because restoring an older snapshot over a
     newer one would silently discard that newer work.
     """
-    return import_batch.undo(conn, batch_id)
+    return import_batch.undo(conn, batch_id, upload_dir=UPLOAD_DIR)
 
 
 def _dst_note(report: dict) -> str:

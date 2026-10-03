@@ -103,7 +103,7 @@ Trade reconstruction, P&L, commissions, statistics, and other core trading calcu
 - **Settings**: the name library. Strategies, sources and tags in one place, with rename, merge and
   delete. Merging rewrites every trade that used the old name and remembers it, so the next diary
   analysis that produces the duplicate saves it under the name you kept
-- **Import**: Thinkorswim account statement CSV and Interactive Brokers (IBKR) Activity Statement CSV, with a broker dropdown (auto-detect by default). Any other broker imports through a generic CSV template, one row per fill
+- **Import**: Thinkorswim account statement CSV and Interactive Brokers (IBKR) Activity Statement CSV, with a broker dropdown (auto-detect by default). Any other broker imports through a generic CSV template, one row per fill. Preview Import parses the file and reports what would be added, changed or skipped — including any row with its line number that could not be read — before a single write, and every import that changed the journal keeps an undoable batch under Recent imports
 
 ## Screenshots
 

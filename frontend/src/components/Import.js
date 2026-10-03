@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from 'react';
-import { Upload, FileText, Image, CheckCircle, AlertCircle, CandlestickChart } from 'lucide-react';
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, FileText, Image, CheckCircle, AlertCircle, CandlestickChart, RotateCcw } from 'lucide-react';
 import { importApi } from '../api';
 import { INSTRUMENT_TYPES } from '../instruments';
 import { PageHeader } from './ui';
@@ -178,6 +178,19 @@ export default function Import({ accounts, accountId }) {
   const [csvResult, setCsvResult] = useState(null);
   const [csvError, setCsvError] = useState(null);
 
+  // Two-step import: the preview describes *this* file, for *this* account, at
+  // *this* broker. Changing any of the three invalidates it — otherwise the
+  // confirm button would import what was previewed, which is no longer the file
+  // on screen.
+  const [preview, setPreview] = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+
+  // Recent imports for the selected account, so an undo is still available
+  // after a reload rather than only in the moment after importing.
+  const [batches, setBatches] = useState([]);
+  const [undoingId, setUndoingId] = useState(null);
+  const [undoMsg, setUndoMsg] = useState(null);
+
   // Diary upload state
   const [diaryFile, setDiaryFile] = useState(null);
   const [diaryDate, setDiaryDate] = useState(new Date().toISOString().slice(0, 10));
@@ -191,6 +204,70 @@ export default function Import({ accounts, accountId }) {
   const [importingBars, setImportingBars] = useState(false);
   const [barsResult, setBarsResult] = useState(null);
   const [barsError, setBarsError] = useState(null);
+
+  // Anything that changes what would be imported clears the preview and the
+  // result: a confirm button showing a stale answer is worse than no preview.
+  // The epoch is declared above so a selection change also invalidates a request
+  // that is already in flight.
+  const previewSeq = useRef(0);
+  useEffect(() => {
+    // Bump the request epoch synchronously with each committed selection. A
+    // preview started for the previous file/account/broker can then never land
+    // on the new selection, even before the next click calls preview again.
+    previewSeq.current += 1;
+    setPreview(null);
+    setCsvResult(null);
+    setCsvError(null);
+    setUndoMsg(null);
+    setPreviewing(false);
+  }, [csvFile, csvAccountId, csvBroker]);
+
+  const batchSeq = useRef(0);
+  const loadBatches = useCallback(async () => {
+    const seq = ++batchSeq.current;
+    if (!csvAccountId) { setBatches([]); return; }
+    try {
+      const res = await importApi.batches(csvAccountId);
+      if (seq !== batchSeq.current) return;
+      setBatches(res.data?.batches || []);
+    } catch (e) {
+      if (seq !== batchSeq.current) return;
+      setBatches([]);
+    }
+  }, [csvAccountId]);
+
+  useEffect(() => { loadBatches(); }, [loadBatches]);
+
+  const handleCsvPreview = async () => {
+    if (!csvFile || !csvAccountId) {
+      setCsvError('Please select a file and an account.');
+      return;
+    }
+    const seq = ++previewSeq.current;
+    const requestFile = csvFile;
+    const requestAccount = csvAccountId;
+    const requestBroker = csvBroker;
+    setPreviewing(true);
+    setCsvResult(null);
+    setCsvError(null);
+    setUndoMsg(null);
+    const fd = new FormData();
+    fd.append('file', requestFile);
+    fd.append('account_id', requestAccount);
+    fd.append('broker', requestBroker);
+    try {
+      const res = await importApi.previewCsv(fd);
+      // Ignore an answer for a selection that has changed while it was in flight.
+      if (seq !== previewSeq.current) return;
+      setPreview(res.data);
+    } catch (e) {
+      if (seq !== previewSeq.current) return;
+      setPreview(null);
+      setCsvError(e.response?.data?.error || e.message);
+    } finally {
+      if (seq === previewSeq.current) setPreviewing(false);
+    }
+  };
 
   const handleCsvImport = async () => {
     if (!csvFile || !csvAccountId) {
@@ -207,10 +284,30 @@ export default function Import({ accounts, accountId }) {
     try {
       const res = await importApi.importCsv(fd);
       setCsvResult(res.data);
+      // The preview has been spent: its counts are now history, not a promise.
+      setPreview(null);
+      await loadBatches();
     } catch (e) {
       setCsvError(e.response?.data?.error || e.message);
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleUndo = async (batchId) => {
+    setUndoingId(batchId);
+    setUndoMsg(null);
+    setCsvError(null);
+    try {
+      const res = await importApi.undoBatch(batchId);
+      setUndoMsg(res.data?.message || 'Import reverted.');
+      await loadBatches();
+    } catch (e) {
+      // Refusals carry {error}; a 4xx here is an explanation, not a crash.
+      setUndoMsg(null);
+      setCsvError(e.response?.data?.error || e.message);
+    } finally {
+      setUndoingId(null);
     }
   };
 
@@ -321,11 +418,80 @@ export default function Import({ accounts, accountId }) {
           <button
             className="btn btn-primary"
             style={{ width: '100%', justifyContent: 'center', marginTop: 16 }}
-            onClick={handleCsvImport}
-            disabled={importing || !csvFile || !csvAccountId}
+            onClick={handleCsvPreview}
+            disabled={previewing || importing || !csvFile || !csvAccountId}
           >
-            {importing ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Importing...</> : <><Upload size={16} /> Import Trades</>}
+            {previewing
+              ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Checking file...</>
+              : <><FileText size={16} /> Preview Import</>}
           </button>
+
+          {preview && (
+            <section className="card" aria-label="Import preview" style={{ marginTop: 14, padding: 16, border: '1px solid var(--divider-strong)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 650, marginBottom: 8 }}>
+                <FileText size={16} color="var(--accent-line)" aria-hidden="true" />
+                Preview · {csvFile?.name}
+              </div>
+              <div role="status" style={{ fontSize: 14, color: 'var(--text-primary)' }}>{preview.message}</div>
+              <div className="grid-2" style={{ marginTop: 12, gap: 8 }}>
+                <div><span className="num" style={{ fontWeight: 700 }}>{preview.create_count}</span> new trade(s)</div>
+                <div><span className="num" style={{ fontWeight: 700 }}>{preview.update_count}</span> to update</div>
+                <div><span className="num" style={{ fontWeight: 700 }}>{preview.replaced_count}</span> to replace</div>
+                <div><span className="num" style={{ fontWeight: 700 }}>{preview.skipped}</span> duplicate fill(s) skipped</div>
+              </div>
+              <div style={{ marginTop: 8, fontSize: 13, color: 'var(--text-secondary)' }}>
+                Net P&amp;L in these trade groups: <span className="num">{preview.net_pnl >= 0 ? '+' : '−'}${Math.abs(preview.net_pnl || 0).toFixed(2)}</span>
+              </div>
+
+              {preview.create?.length > 0 && (
+                <details style={{ marginTop: 10 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 13 }}>New trades ({preview.create_count}{preview.create_count > preview.create.length ? `; first ${preview.create.length}` : ''})</summary>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>{preview.create.join(', ')}</div>
+                </details>
+              )}
+              {preview.update?.length > 0 && (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 13 }}>Trades to update ({preview.update_count}{preview.update_count > preview.update.length ? `; first ${preview.update.length}` : ''})</summary>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>{preview.update.join(', ')}</div>
+                </details>
+              )}
+              {preview.replaced?.length > 0 && (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 13 }}>Trades to replace ({preview.replaced_count}{preview.replaced_count > preview.replaced.length ? `; first ${preview.replaced.length}` : ''})</summary>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>{preview.replaced.join(', ')}</div>
+                </details>
+              )}
+
+              {preview.line_errors?.length > 0 && (
+                <div className="notice neg" role="alert" style={{ display: 'block', marginTop: 12 }}>
+                  <div style={{ fontWeight: 650, marginBottom: 6 }}>Rows not imported ({preview.line_errors.length})</div>
+                  <div style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>{preview.line_errors.join('\n')}</div>
+                </div>
+              )}
+              {preview.write_errors?.length > 0 && (
+                <div className="notice neg" role="alert" style={{ display: 'block', marginTop: 8 }}>
+                  <div style={{ fontWeight: 650, marginBottom: 6 }}>Trade rows that cannot be written ({preview.write_errors.length})</div>
+                  {preview.write_errors.map((e, i) => <div key={i} style={{ fontSize: 12 }}>{e.trade_group}: {e.error}</div>)}
+                </div>
+              )}
+
+              {!preview.nothing_to_do && (
+                <button
+                  className="btn btn-primary"
+                  style={{ width: '100%', justifyContent: 'center', marginTop: 14 }}
+                  onClick={handleCsvImport}
+                  disabled={importing || previewing || !csvFile || !csvAccountId}
+                >
+                  {importing
+                    ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Importing...</>
+                    : <><Upload size={16} /> Import Trades</>}
+                </button>
+              )}
+              {preview.nothing_to_do && (
+                <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-secondary)' }}>No confirmation needed — the journal already has these fills.</div>
+              )}
+            </section>
+          )}
 
           {csvResult && (
             <div className="notice pos" role="status" style={{ marginTop: 12 }}>
@@ -333,12 +499,50 @@ export default function Import({ accounts, accountId }) {
                 <CheckCircle size={16} /> Import Complete
               </div>
               <div style={{ fontSize: 14 }}>{csvResult.message}</div>
+              {csvResult.batch_id != null && (
+                <button className="btn btn-ghost" style={{ marginTop: 8 }}
+                  onClick={() => handleUndo(csvResult.batch_id)} disabled={undoingId === csvResult.batch_id}>
+                  {undoingId === csvResult.batch_id ? 'Undoing…' : 'Undo this import'}
+                </button>
+              )}
               {csvResult.errors?.length > 0 && (
                 <div style={{ fontSize: 13, color: 'var(--result-neg)', marginTop: 4 }}>
                   {csvResult.errors.length} DB error(s)
                 </div>
               )}
+              {csvResult.line_errors?.length > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--result-neg)', marginTop: 8, whiteSpace: 'pre-wrap' }}>
+                  {csvResult.line_errors.join('\n')}
+                </div>
+              )}
             </div>
+          )}
+
+          {undoMsg && <div className="notice accent" role="status" style={{ display: 'block', marginTop: 10 }}>{undoMsg}</div>}
+
+          {batches.length > 0 && (
+            <section style={{ marginTop: 18 }} aria-label="Recent imports">
+              <div style={{ fontWeight: 650, marginBottom: 8, fontSize: 14 }}>Recent imports</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {batches.map(batch => (
+                  <div key={batch.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 0', borderTop: '1px solid var(--divider-soft)' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, overflowWrap: 'anywhere' }}>{batch.filename || `Import ${batch.id}`}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                        {batch.created_at} · {batch.groups} trade(s) · {batch.imported} written
+                        {batch.undone_at ? ` · undone ${batch.undone_at}` : ''}
+                      </div>
+                    </div>
+                    {!batch.undone_at && (
+                      <button className="btn btn-ghost" style={{ flexShrink: 0 }}
+                        onClick={() => handleUndo(batch.id)} disabled={undoingId === batch.id}>
+                        {undoingId === batch.id ? 'Undoing…' : 'Undo'}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
           )}
 
           {csvError && (
