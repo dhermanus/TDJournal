@@ -195,6 +195,67 @@ def test_an_upload_runs_the_match_check_before_it_saves(app, monkeypatch):
     assert ta["r_multiple"] == 0.8
 
 
+def test_an_unconfirmed_diary_analysis_cannot_overwrite_manual_trade_fields(app, monkeypatch):
+    """AI can enrich fields a user has not touched; it cannot reset confirmed ones.
+
+    Before the fix, set stop_loss=246.5 by hand then upload a new diary whose
+    extractor returned 248.0 and emotional_state='frustrated': save_analysis_to_db
+    replaced the hand-edited values without asking. A manual match verdict is
+    the signal that these fields have become user-owned.
+    """
+    import sqlite3
+    import main
+    _seed(app, with_diary=False)
+    conn = sqlite3.connect(app.db)
+    conn.execute(
+        "INSERT INTO trade_analysis (trade_group,ticker,date,strategy,stop_loss,target_price,"
+        "r_multiple,emotional_state,match_confidence,match_notes) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("NVDA_1", "NVDA", DATE, "my confirmed setup", 106.25, 110.0, 1.25,
+         "calm", "manual", "confirmed by user"))
+    conn.commit()
+    conn.close()
+
+    raw = {
+        "diary_date": DATE, "overall_summary": "Updated note.",
+        "patterns_identified": [], "improvement_areas": [],
+        "trade_analyses": [{
+            "trade_group": "NVDA_1", "ticker": "NVDA",
+            "strategy": "model setup", "stop_loss": 107.0, "target_price": 112.0,
+            "r_multiple": 0.7, "emotional_state": "frustrated", "mistakes": "moved stop",
+            "entry_reason": "model entry", "exit_reason": "model exit", "notes": "model notes",
+            "ai_feedback": "model feedback on this trade",
+            "idea_source": "Scanner", "match_confidence": "high", "match_notes": "model claim",
+        }],
+    }
+    monkeypatch.setattr(main, "analyze_diary_text",
+                        lambda text, date, ctx: json.loads(json.dumps(raw)))
+
+    r = app.post("/api/upload-diary", files={"file": ("notes.txt", b"updated NVDA plan", "text/plain")},
+                 data={"date": DATE, "account_id": "1"})
+    assert r.status_code == 200, r.text
+    conn = sqlite3.connect(app.db)
+    row = conn.execute(
+        "SELECT strategy,stop_loss,target_price,r_multiple,emotional_state,mistakes,"
+        "entry_reason,match_confidence,match_notes,idea_source "
+        "FROM trade_analysis WHERE trade_group='NVDA_1'").fetchone()
+    conn.close()
+    assert row[0] == "my confirmed setup", row
+    assert row[1:6] == (106.25, 110.0, 1.25, "calm", None), row
+    assert row[7:9] == ("manual", "confirmed by user"), row
+    # idea_source is edited in the same Stats form and mirrored into Settings'
+    # Sources list, so it is user-owned too — a model must not source the idea.
+    assert row[9] is None, row
+    # The model's own bookkeeping still lands: the diary link and its feedback.
+    conn = sqlite3.connect(app.db)
+    linked = conn.execute(
+        "SELECT diary_entry_id IS NOT NULL, ai_feedback "
+        "FROM trade_analysis WHERE trade_group='NVDA_1'").fetchone()
+    conn.close()
+    assert linked[0] == 1, "the diary entry must still be linked to the trade"
+    assert linked[1] is not None, "the model's feedback should be visible"
+
+
 def test_a_diary_entry_with_unreadable_json_is_still_listable(app):
     import sqlite3
     _seed(app)

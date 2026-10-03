@@ -301,6 +301,10 @@ export default function Import({ accounts, accountId }) {
     try {
       const res = await importApi.undoBatch(batchId);
       setUndoMsg(res.data?.message || 'Import reverted.');
+      // Undo changes the journal state the last preview described. It must not
+      // remain on screen as if it still matches; a new preview is required.
+      setPreview(null);
+      setCsvResult(null);
       await loadBatches();
     } catch (e) {
       // Refusals carry {error}; a 4xx here is an explanation, not a crash.

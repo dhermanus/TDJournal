@@ -501,6 +501,40 @@ function CashFlowSettings() {
 
   useEffect(() => { load(); }, [load]);
 
+  // After a change, refresh only the account it belonged to. Re-running load()
+  // here would rebuild *every* account's draft from the server and silently
+  // discard a value the user typed into a different account but had not saved
+  // yet — which is exactly what happened when saving account A wiped the number
+  // being entered for account B.
+  const refreshAccount = useCallback(async (accountId) => {
+    try {
+      const [acctRes, flowRes] = await Promise.all([
+        accountsApi.list(),
+        accountId != null ? accountsApi.cashFlows(accountId) : Promise.resolve(null),
+      ]);
+      const rows = acctRes.data || [];
+      setAccounts(rows);
+      setCapitalDraft(prev => {
+        const next = { ...prev };
+        const saved = rows.find(a => a.id === accountId);
+        if (saved) {
+          next[saved.id] = saved.starting_capital == null ? '' : String(saved.starting_capital);
+        }
+        return next;
+      });
+      if (flowRes && accountId != null) {
+        setFlowsByAccount(prev => ({ ...prev, [accountId]: flowRes.data?.flows || [] }));
+      }
+      setDraft(prev => ({
+        ...prev,
+        [accountId]: prev[accountId] || { kind: 'deposit', amount: '', flow_date: todayISO(), note: '' },
+      }));
+      setError(null);
+    } catch (e) {
+      setError(errText(e));
+    }
+  }, []);
+
   const saveCapital = async (account) => {
     const raw = (capitalDraft[account.id] ?? '').trim();
     const value = raw === '' ? null : Number(raw);
@@ -514,7 +548,7 @@ function CashFlowSettings() {
       setNotice(value === null
         ? `Starting capital cleared for ${account.name} — equity percentages will show —.`
         : `Starting capital saved for ${account.name}.`);
-      await load();
+      await refreshAccount(account.id);
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -535,7 +569,7 @@ function CashFlowSettings() {
         kind: d.kind, amount, flow_date: d.flow_date, note: d.note?.trim() || null,
       });
       setNotice(`${d.kind === 'deposit' ? 'Deposit' : 'Withdrawal'} saved for ${account.name}.`);
-      await load();
+      await refreshAccount(account.id);
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -558,7 +592,7 @@ function CashFlowSettings() {
       });
       setEditing(null);
       setNotice('Cash flow updated.');
-      await load();
+      await refreshAccount(account.id);
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -571,7 +605,7 @@ function CashFlowSettings() {
     try {
       await accountsApi.removeCashFlow(account.id, flow.id);
       setNotice('Cash flow removed.');
-      await load();
+      await refreshAccount(account.id);
     } catch (e) {
       setError(errText(e));
     } finally {

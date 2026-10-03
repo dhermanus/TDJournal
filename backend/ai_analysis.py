@@ -383,22 +383,50 @@ def save_analysis_to_db(conn, diary_entry_id: int, analysis: dict):
                  match_confidence, match_notes, diary_entry_id, idea_source)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(trade_group) DO UPDATE SET
-                strategy=excluded.strategy,
-                stop_loss=excluded.stop_loss,
-                target_price=excluded.target_price,
-                risk_per_trade=excluded.risk_per_trade,
-                risk_reward=excluded.risk_reward,
-                r_multiple=excluded.r_multiple,
-                entry_reason=excluded.entry_reason,
-                exit_reason=excluded.exit_reason,
-                mistakes=excluded.mistakes,
-                emotional_state=excluded.emotional_state,
-                notes=excluded.notes,
+                strategy=CASE WHEN trade_analysis.match_confidence = 'manual'
+                              AND excluded.match_confidence <> 'manual'
+                              THEN trade_analysis.strategy ELSE excluded.strategy END,
+                stop_loss=CASE WHEN trade_analysis.match_confidence = 'manual'
+                               AND excluded.match_confidence <> 'manual'
+                               THEN trade_analysis.stop_loss ELSE excluded.stop_loss END,
+                target_price=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                  AND excluded.match_confidence <> 'manual'
+                                  THEN trade_analysis.target_price ELSE excluded.target_price END,
+                risk_per_trade=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                    AND excluded.match_confidence <> 'manual'
+                                    THEN trade_analysis.risk_per_trade ELSE excluded.risk_per_trade END,
+                risk_reward=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                 AND excluded.match_confidence <> 'manual'
+                                 THEN trade_analysis.risk_reward ELSE excluded.risk_reward END,
+                r_multiple=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                AND excluded.match_confidence <> 'manual'
+                                THEN trade_analysis.r_multiple ELSE excluded.r_multiple END,
+                entry_reason=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                  AND excluded.match_confidence <> 'manual'
+                                  THEN trade_analysis.entry_reason ELSE excluded.entry_reason END,
+                exit_reason=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                 AND excluded.match_confidence <> 'manual'
+                                 THEN trade_analysis.exit_reason ELSE excluded.exit_reason END,
+                mistakes=CASE WHEN trade_analysis.match_confidence = 'manual'
+                              AND excluded.match_confidence <> 'manual'
+                              THEN trade_analysis.mistakes ELSE excluded.mistakes END,
+                emotional_state=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                     AND excluded.match_confidence <> 'manual'
+                                     THEN trade_analysis.emotional_state ELSE excluded.emotional_state END,
+                notes=CASE WHEN trade_analysis.match_confidence = 'manual'
+                           AND excluded.match_confidence <> 'manual'
+                           THEN trade_analysis.notes ELSE excluded.notes END,
                 ai_feedback=excluded.ai_feedback,
-                match_confidence=excluded.match_confidence,
-                match_notes=excluded.match_notes,
+                match_confidence=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                      AND excluded.match_confidence <> 'manual'
+                                      THEN trade_analysis.match_confidence ELSE excluded.match_confidence END,
+                match_notes=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                 AND excluded.match_confidence <> 'manual'
+                                 THEN trade_analysis.match_notes ELSE excluded.match_notes END,
                 diary_entry_id=excluded.diary_entry_id,
-                idea_source=excluded.idea_source
+                idea_source=CASE WHEN trade_analysis.match_confidence = 'manual'
+                                 AND excluded.match_confidence <> 'manual'
+                                 THEN trade_analysis.idea_source ELSE excluded.idea_source END
         """, (
             trade_group,
             ta.get('ticker', ''),
