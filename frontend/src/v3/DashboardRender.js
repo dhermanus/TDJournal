@@ -356,6 +356,31 @@ export default function DashboardRender(p) {
       met: (k.expectancy || 0) >= gExp,
       read: 'What the next trade is worth, on average',
     },
+    {
+      label: 'Return on equity', value: k.return_pct == null ? '—' : `${Number(k.return_pct).toFixed(2)}%`,
+      // goalPct omitted on purpose: Measures renders a goal track whenever it is
+      // not null, and these three are observations, not goals to beat.
+      met: k.return_pct != null && k.return_pct >= 0,
+      read: k.equity_base == null
+        ? `${k.unknown_accounts ? `${k.unknown_accounts} account(s) still need starting capital` : 'Set starting capital in Settings'}`
+        : `Net P&L ${money2(k.total_net_pnl || 0)} on ${money2(k.equity_base)} of equity`,
+    },
+    {
+      label: 'Max drawdown / equity', value: k.max_drawdown_pct == null ? '—' : `${Number(k.max_drawdown_pct).toFixed(2)}%`,
+      met: k.max_drawdown_pct != null && k.max_drawdown_pct < 10,
+      amber: k.max_drawdown_pct != null && k.max_drawdown_pct >= 10,
+      read: k.equity_base == null
+        ? 'Set starting capital to measure drawdown against equity'
+        : `${money2(k.max_drawdown || 0)} of ${money2(k.equity_base)} equity`,
+    },
+    {
+      label: 'Largest losing day / equity', value: k.largest_loss_pct == null ? '—' : `${Number(k.largest_loss_pct).toFixed(2)}%`,
+      met: k.largest_loss_pct != null && k.largest_loss_pct < 2,
+      amber: k.largest_loss_pct != null && k.largest_loss_pct >= 2,
+      read: k.largest_loss_pct == null
+        ? 'Set starting capital to size losing days'
+        : `Worst session as a share of equity`,
+    },
   ];
 
   // daily_pnl carries no trade count, but it does carry the running total,

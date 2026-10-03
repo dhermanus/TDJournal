@@ -44,6 +44,7 @@ from ai_usage import last_usage, forget_usage, friendly_error
 import ai_settings
 from library import router as library_router, init_library_tables, apply_aliases, library_names
 import instruments
+import equity
 import mt5_time
 import backup
 import import_batch
@@ -362,6 +363,7 @@ class AccountCreate(BaseModel):
     type: str
     color: str = "#6366f1"
     broker: str | None = None
+    starting_capital: float | None = None
 
 
 @app.get("/api/accounts")
@@ -375,6 +377,20 @@ class AccountUpdate(BaseModel):
     type: str | None = None
     color: str | None = None
     broker: str | None = None
+    starting_capital: float | None = None
+
+
+def _check_starting_capital(value: float | None) -> None:
+    """Capital is a denominator, so it has to be a non-negative number.
+
+    A negative starting balance has no meaning against these ratios (return on
+    what?) and would flip every percentage, so it is refused rather than stored
+    and interpreted later. None clears it back to "unknown".
+    """
+    if value is None:
+        return
+    if not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("Starting capital must be a number of 0 or more.")
 
 
 @app.put("/api/accounts/{account_id}")
@@ -383,7 +399,11 @@ def update_account(account_id: int, data: AccountUpdate, conn: sqlite3.Connectio
     if not row:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    # exclude_unset distinguishes "not mentioned" from "explicitly set to null":
+    # clearing capital back to unknown has to be expressible, while the other
+    # fields keep the existing behaviour where a null is ignored.
+    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items()
+               if v is not None or k == "starting_capital"}
     if not updates:
         return row_to_dict(row)
 
@@ -391,6 +411,8 @@ def update_account(account_id: int, data: AccountUpdate, conn: sqlite3.Connectio
         valid_types = {'day_trading', 'swing_trading', 'investment'}
         if updates['type'] not in valid_types:
             raise ValueError(f"type must be one of {valid_types}")
+    if 'starting_capital' in updates:
+        _check_starting_capital(updates['starting_capital'])
 
     set_clause = ', '.join(f"{k}=?" for k in updates)
     conn.execute(f"UPDATE accounts SET {set_clause} WHERE id=?", list(updates.values()) + [account_id])
@@ -405,10 +427,11 @@ def create_account(data: AccountCreate, conn: sqlite3.Connection = Depends(get_c
     valid_types = {'day_trading', 'swing_trading', 'investment'}
     if data.type not in valid_types:
         raise ValueError(f"type must be one of {valid_types}")
+    _check_starting_capital(data.starting_capital)
 
     cursor = conn.execute(
-        "INSERT INTO accounts (name, type, color, broker) VALUES (?,?,?,?)",
-        (data.name, data.type, data.color, data.broker)
+        "INSERT INTO accounts (name, type, color, broker, starting_capital) VALUES (?,?,?,?,?)",
+        (data.name, data.type, data.color, data.broker, data.starting_capital)
     )
     conn.commit()
 
@@ -1937,8 +1960,115 @@ def get_kpis(
         "by_strategy": by_strategy,
         "expectancy": expectancy,
         "max_drawdown": round(max_drawdown, 2),
+        # Equity ratios (item 13): capital + cash flows against the P&L above.
+        # Percentages are None when the account has no starting balance, so the
+        # caller shows "—" instead of inventing a denominator.
+        **equity.summarize(conn, account_id=account_id, date_from=date_from,
+                           total_net_pnl=total_net_pnl, max_drawdown=max_drawdown,
+                           daily_pnl=daily_pnl),
         **_excursion_kpis(conn, account_id, date_from, date_to),
     }
+
+
+class CashFlowCreate(BaseModel):
+    kind: str
+    amount: float
+    flow_date: str
+    note: str | None = None
+
+
+class CashFlowUpdate(BaseModel):
+    kind: str | None = None
+    amount: float | None = None
+    flow_date: str | None = None
+    note: str | None = None
+
+
+def _checked_iso_date(value: str) -> str:
+    if not _DIARY_DATE_RE.fullmatch(value):
+        raise ValueError("flow_date must be a calendar date as YYYY-MM-DD.")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("flow_date must be a real calendar date.") from exc
+    return value
+
+
+def _checked_cash_flow(kind: str | None, amount: float | None,
+                       flow_date: str | None) -> None:
+    if kind is not None and kind not in ("deposit", "withdrawal"):
+        raise ValueError("kind must be 'deposit' or 'withdrawal'.")
+    if amount is not None and amount <= 0:
+        raise ValueError("amount must be greater than 0; the kind sets the direction.")
+    if flow_date is not None:
+        _checked_iso_date(flow_date)
+
+
+@app.get("/api/accounts/{account_id}/cash-flows")
+def list_cash_flows(account_id: int, conn: sqlite3.Connection = Depends(get_connection)):
+    if not conn.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+        raise HTTPException(status_code=404, detail="Account not found")
+    rows = conn.execute(
+        "SELECT id, account_id, kind, amount, flow_date, note, created_at "
+        "FROM account_cash_flows WHERE account_id=? ORDER BY flow_date, id",
+        (account_id,),
+    ).fetchall()
+    flows = [row_to_dict(r) for r in rows]
+    return {"flows": flows,
+            "net_flows": round(sum(f["amount"] if f["kind"] == "deposit" else -f["amount"]
+                                    for f in flows), 2)}
+
+
+@app.post("/api/accounts/{account_id}/cash-flows", status_code=201)
+def create_cash_flow(account_id: int, data: CashFlowCreate,
+                     conn: sqlite3.Connection = Depends(get_connection)):
+    if not conn.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+        raise HTTPException(status_code=404, detail="Account not found")
+    _checked_cash_flow(data.kind, data.amount, data.flow_date)
+    cur = conn.execute(
+        "INSERT INTO account_cash_flows (account_id, kind, amount, flow_date, note) "
+        "VALUES (?,?,?,?,?)",
+        (account_id, data.kind, data.amount, data.flow_date, data.note),
+    )
+    conn.commit()
+    return row_to_dict(conn.execute(
+        "SELECT id, account_id, kind, amount, flow_date, note, created_at "
+        "FROM account_cash_flows WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+@app.put("/api/accounts/{account_id}/cash-flows/{flow_id}")
+def update_cash_flow(account_id: int, flow_id: int, data: CashFlowUpdate,
+                     conn: sqlite3.Connection = Depends(get_connection)):
+    row = conn.execute(
+        "SELECT * FROM account_cash_flows WHERE id=? AND account_id=?", (flow_id, account_id)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Cash flow not found")
+    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+    if not updates:
+        return row_to_dict(row)
+    merged = {k: updates.get(k, row[k]) for k in ("kind", "amount", "flow_date")}
+    _checked_cash_flow(merged["kind"], merged["amount"], merged["flow_date"])
+    conn.execute(
+        "UPDATE account_cash_flows SET " + ", ".join(f"{k}=?" for k in updates) + " WHERE id=?",
+        [*updates.values(), flow_id],
+    )
+    conn.commit()
+    return row_to_dict(conn.execute(
+        "SELECT id, account_id, kind, amount, flow_date, note, created_at "
+        "FROM account_cash_flows WHERE id=?", (flow_id,)).fetchone())
+
+
+@app.delete("/api/accounts/{account_id}/cash-flows/{flow_id}")
+def delete_cash_flow(account_id: int, flow_id: int,
+                     conn: sqlite3.Connection = Depends(get_connection)):
+    cur = conn.execute(
+        "DELETE FROM account_cash_flows WHERE id=? AND account_id=?", (flow_id, account_id)
+    )
+    if not cur.rowcount:
+        raise HTTPException(status_code=404, detail="Cash flow not found")
+    conn.commit()
+    return {"deleted": True, "id": flow_id}
 
 
 # ── Diary Upload ───────────────────────────────────────────────────────────────
@@ -2801,14 +2931,14 @@ def get_reports(
     for r in raw:
         by_day[r['date']] = by_day.get(r['date'], 0.0) + r['net_pnl']
 
-    equity, cum, peak, max_dd, max_dd_date = [], 0.0, 0.0, 0.0, None
+    curve, cum, peak, max_dd, max_dd_date = [], 0.0, 0.0, 0.0, None
     for d, p in by_day.items():
         cum += p
         peak = max(peak, cum)
         dd = cum - peak
         if dd < max_dd:
             max_dd, max_dd_date = dd, d
-        equity.append({"date": d, "pnl": round(p, 2),
+        curve.append({"date": d, "pnl": round(p, 2),
                        "cumulative": round(cum, 2), "drawdown": round(dd, 2)})
 
     # Streaks over trades in chronological order. A scratch (net P&L exactly 0)
@@ -2862,11 +2992,20 @@ def get_reports(
             "timezone": tz_name if tz_name else "stored-as-is",
             "timezone_error": tz_error,
         },
-        "equity_curve": equity,
+        "equity_curve": curve,
+        # The same ratios KPIs report, built on this endpoint's own curve: the
+        # equity curve here carries `cumulative` per day, which is the shape
+        # equity.ratios reads. Sharing it means Reports and the Dashboard cannot
+        # disagree about what a percentage is a percentage of.
         "summary": {
             "net_pnl": round(sum(r['net_pnl'] for r in raw), 2),
             "max_drawdown": round(max_dd, 2),
             "max_drawdown_date": max_dd_date,
+            **equity.summarize(conn, account_id=account_id, date_from=date_from,
+                               total_net_pnl=round(sum(r['net_pnl'] for r in raw), 2),
+                               max_drawdown=max_dd,
+                               daily_pnl=[{"date": e["date"], "net_pnl": e["pnl"],
+                                           "cumulative": e["cumulative"]} for e in curve]),
             "best_day": round(max(day_pnls), 2) if day_pnls else 0,
             "worst_day": round(min(day_pnls), 2) if day_pnls else 0,
             "trading_days": len(by_day),

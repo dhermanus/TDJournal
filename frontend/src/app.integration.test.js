@@ -554,12 +554,12 @@ test('Day Review keeps the loss-streak alert and its Dismiss control', async () 
   expect(screen.getByRole('button', { name: /Regenerate AI/ })).toBeInTheDocument();
 });
 
-test('Settings has Strategies, Sources, Tags, Import and Backup sections, and Tags leaves out strategy and source types', async () => {
+test('Settings has Strategies, Sources, Tags, AI, Import and Backup sections, and Tags leaves out strategy and source types', async () => {
   await renderApp();
   fireEvent.click(within(nav()).getByRole('button', { name: 'Settings' }));
   const tablist = await screen.findByRole('tablist', { name: 'Settings sections' });
   expect(within(tablist).getAllByRole('tab').map(t => t.textContent.replace(/\d+/g, '').trim()))
-    .toEqual(['Strategies', 'Sources', 'Tags', 'Import', 'Backup']);
+    .toEqual(['Strategies', 'Sources', 'Tags', 'AI', 'Import', 'Backup']);
   expect(await screen.findByText('VWAP Cross')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Edit VWAP Cross' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Delete VWAP Cross' })).toBeInTheDocument();

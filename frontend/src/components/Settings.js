@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Plus, Pencil, GitMerge, Trash2, Search } from 'lucide-react';
-import { libraryApi, mt5TimezoneApi, backupApi, aiSettingsApi } from '../api';
+import { Plus, Pencil, GitMerge, Trash2, Search, CheckCircle, AlertCircle } from 'lucide-react';
+import { libraryApi, mt5TimezoneApi, backupApi, aiSettingsApi, accountsApi } from '../api';
 import { PageHeader } from './ui';
 
 const SECTIONS = [
@@ -8,6 +8,7 @@ const SECTIONS = [
   { id: 'source', label: 'Sources' },
   { id: 'tag', label: 'Tags' },
   { id: 'ai', label: 'AI' },
+  { id: 'capital', label: 'Capital & Cash Flows' },
   { id: 'import', label: 'Import' },
   { id: 'backup', label: 'Backup' },
 ];
@@ -448,6 +449,290 @@ function AiSettings() {
 }
 
 
+// ── Capital & cash flows ──────────────────────────────────────────────────────
+// Starting capital is the denominator behind every equity percentage the
+// Dashboard shows; deposits and withdrawals move it over time. Two rules drive
+// this screen, both of them inherited from equity.py:
+//
+//   * no capital means "unknown", never 0 — the UI shows — rather than a
+//     percentage of a balance nobody gave; and
+//   * the base for a date range is capital plus only the flows *before* it, so
+//     the per-account note here says "current", not "total ever".
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const money = v => `$${Number(v || 0).toLocaleString('en-US', {
+  minimumFractionDigits: 2, maximumFractionDigits: 2,
+})}`;
+
+function CashFlowSettings() {
+  const [accounts, setAccounts] = useState([]);
+  const [flowsByAccount, setFlowsByAccount] = useState({});
+  const [capitalDraft, setCapitalDraft] = useState({});
+  const [draft, setDraft] = useState({});
+  const [editing, setEditing] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const res = await accountsApi.list();
+      const rows = res.data || [];
+      setAccounts(rows);
+      setCapitalDraft(Object.fromEntries(rows.map(a => [
+        a.id, a.starting_capital == null ? '' : String(a.starting_capital),
+      ])));
+      setDraft(Object.fromEntries(rows.map(a => [a.id, {
+        kind: 'deposit', amount: '', flow_date: todayISO(), note: '',
+      }])));
+      const loaded = await Promise.all(rows.map(async a => {
+        try {
+          const r = await accountsApi.cashFlows(a.id);
+          return [a.id, r.data?.flows || []];
+        } catch (e) {
+          return [a.id, []];
+        }
+      }));
+      setFlowsByAccount(Object.fromEntries(loaded));
+    } catch (e) {
+      setError(errText(e));
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const saveCapital = async (account) => {
+    const raw = (capitalDraft[account.id] ?? '').trim();
+    const value = raw === '' ? null : Number(raw);
+    if (value !== null && (!Number.isFinite(value) || value < 0)) {
+      setError('Starting capital must be a number of 0 or more.');
+      return;
+    }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await accountsApi.update(account.id, { starting_capital: value });
+      setNotice(value === null
+        ? `Starting capital cleared for ${account.name} — equity percentages will show —.`
+        : `Starting capital saved for ${account.name}.`);
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addFlow = async (account) => {
+    const d = draft[account.id] || {};
+    const amount = Number(d.amount);
+    if (!d.flow_date || !['deposit', 'withdrawal'].includes(d.kind) || !Number.isFinite(amount) || amount <= 0) {
+      setError('Pick deposit or withdrawal, an amount above 0, and a date.');
+      return;
+    }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await accountsApi.addCashFlow(account.id, {
+        kind: d.kind, amount, flow_date: d.flow_date, note: d.note?.trim() || null,
+      });
+      setNotice(`${d.kind === 'deposit' ? 'Deposit' : 'Withdrawal'} saved for ${account.name}.`);
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveFlow = async (account) => {
+    if (!editing || editing.accountId !== account.id) return;
+    const amount = Number(editing.amount);
+    if (!editing.flow_date || !Number.isFinite(amount) || amount <= 0) {
+      setError('Amount must be above 0 and the date must be set.');
+      return;
+    }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await accountsApi.updateCashFlow(account.id, editing.id, {
+        kind: editing.kind, amount, flow_date: editing.flow_date,
+        note: editing.note?.trim() || null,
+      });
+      setEditing(null);
+      setNotice('Cash flow updated.');
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeFlow = async (account, flow) => {
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await accountsApi.removeCashFlow(account.id, flow.id);
+      setNotice('Cash flow removed.');
+      await load();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="card">
+      <div className="section-title">Capital &amp; Cash Flows</div>
+      <div className="section-sub" style={{ marginBottom: 14 }}>
+        Starting capital is what the Dashboard's return and drawdown percentages
+        are measured against. Leave it blank and those numbers show — rather than
+        dividing by a balance you never gave.
+      </div>
+
+      {error && <div className="notice neg" role="alert" style={{ display: 'block', marginBottom: 12 }}>{error}</div>}
+      {notice && <div className="notice accent" role="status" style={{ display: 'block', marginBottom: 12 }}>{notice}</div>}
+      {!accounts.length && !error && <div className="empty">Create an account first.</div>}
+
+      {accounts.map(account => {
+        const flows = flowsByAccount[account.id] || [];
+        const capital = capitalDraft[account.id] ?? '';
+        const net = flows.reduce(
+          (sum, f) => sum + (f.kind === 'deposit' ? Number(f.amount) : -Number(f.amount)), 0);
+        const base = capital === '' ? null : Number(capital) + net;
+        const d = draft[account.id] || { kind: 'deposit', amount: '', flow_date: todayISO(), note: '' };
+
+        return (
+          <section key={account.id} className="card" aria-label={`Capital for ${account.name}`}
+            style={{ marginTop: 12, padding: 16, border: '1px solid var(--divider-soft)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <span className="acct-dot" style={{ background: account.color }} aria-hidden="true" />
+              <strong>{account.name}</strong>
+              <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
+                · {account.type.replace('_', ' ')}
+              </span>
+            </div>
+
+            <label className="field-label" htmlFor={`capital-${account.id}`}>Starting capital</label>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+              <input id={`capital-${account.id}`} type="number" min="0" step="0.01"
+                placeholder="0.00" value={capital} style={{ width: '100%' }}
+                onChange={e => setCapitalDraft(prev => ({ ...prev, [account.id]: e.target.value }))} />
+              <button className="btn btn-primary" type="button" style={{ flexShrink: 0 }}
+                onClick={() => saveCapital(account)} disabled={busy}>Save</button>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+              {base === null
+                ? 'Not set — equity percentages show — for this account.'
+                : `Current equity base: ${money(base)} · ${money(capital)} ${net >= 0 ? '+' : '−'} ${money(Math.abs(net))} net flows`}
+            </div>
+
+            <div style={{ borderTop: '1px solid var(--divider-soft)', marginTop: 14, paddingTop: 12 }}>
+              <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>
+                Deposits and withdrawals
+              </div>
+
+              {flows.length > 0 && (
+                <div className="scroll-x" style={{ marginBottom: 10 }}>
+                  <table style={{ minWidth: 520 }}>
+                    <thead>
+                      <tr><th>Date</th><th>Type</th><th className="num">Amount</th><th>Note</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody>
+                      {flows.map(flow => {
+                        const isEditing = editing?.id === flow.id && editing?.accountId === account.id;
+                        const e = isEditing ? editing : flow;
+                        return (
+                          <tr key={flow.id}>
+                            <td>{isEditing
+                              ? <input aria-label={`Date for cash flow ${flow.id}`} type="date"
+                                  value={e.flow_date}
+                                  onChange={ev => setEditing({ ...e, flow_date: ev.target.value })} />
+                              : flow.flow_date}</td>
+                            <td>{isEditing
+                              ? <select aria-label={`Type for cash flow ${flow.id}`} value={e.kind}
+                                  onChange={ev => setEditing({ ...e, kind: ev.target.value })}>
+                                  <option value="deposit">Deposit</option>
+                                  <option value="withdrawal">Withdrawal</option>
+                                </select>
+                              : flow.kind}</td>
+                            <td className="num">{isEditing
+                              ? <input aria-label={`Amount for cash flow ${flow.id}`} type="number"
+                                  min="0.01" step="0.01" value={e.amount}
+                                  onChange={ev => setEditing({ ...e, amount: ev.target.value })} />
+                              : money(flow.amount)}</td>
+                            <td>{isEditing
+                              ? <input aria-label={`Note for cash flow ${flow.id}`} value={e.note || ''}
+                                  onChange={ev => setEditing({ ...e, note: ev.target.value })} />
+                              : (flow.note || '—')}</td>
+                            <td><div style={{ display: 'flex', gap: 4 }}>
+                              {isEditing ? (
+                                <>
+                                  <button className="btn btn-ghost btn-icon" type="button"
+                                    aria-label={`Save cash flow ${flow.id}`} disabled={busy}
+                                    onClick={() => saveFlow(account)}><CheckCircle size={15} /></button>
+                                  <button className="btn btn-ghost btn-icon" type="button"
+                                    aria-label={`Cancel editing cash flow ${flow.id}`}
+                                    onClick={() => setEditing(null)}><AlertCircle size={15} /></button>
+                                </>
+                              ) : (
+                                <>
+                                  <button className="btn btn-ghost btn-icon" type="button"
+                                    aria-label={`Edit cash flow ${flow.id}`}
+                                    onClick={() => setEditing({ ...flow, accountId: account.id, amount: String(flow.amount) })}>
+                                    <Pencil size={15} />
+                                  </button>
+                                  <button className="btn btn-ghost btn-icon" type="button"
+                                    aria-label={`Delete cash flow ${flow.id}`} disabled={busy}
+                                    onClick={() => removeFlow(account, flow)}><Trash2 size={15} /></button>
+                                </>
+                              )}
+                            </div></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="grid-2" style={{ gap: 8 }}>
+                <div>
+                  <label className="field-label" htmlFor={`flow-kind-${account.id}`}>Type</label>
+                  <select id={`flow-kind-${account.id}`} value={d.kind}
+                    onChange={ev => setDraft(p => ({ ...p, [account.id]: { ...d, kind: ev.target.value } }))}>
+                    <option value="deposit">Deposit</option>
+                    <option value="withdrawal">Withdrawal</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="field-label" htmlFor={`flow-amount-${account.id}`}>Amount</label>
+                  <input id={`flow-amount-${account.id}`} type="number" min="0.01" step="0.01"
+                    value={d.amount}
+                    onChange={ev => setDraft(p => ({ ...p, [account.id]: { ...d, amount: ev.target.value } }))} />
+                </div>
+                <div>
+                  <label className="field-label" htmlFor={`flow-date-${account.id}`}>Date</label>
+                  <input id={`flow-date-${account.id}`} type="date" value={d.flow_date}
+                    onChange={ev => setDraft(p => ({ ...p, [account.id]: { ...d, flow_date: ev.target.value } }))} />
+                </div>
+                <div>
+                  <label className="field-label" htmlFor={`flow-note-${account.id}`}>Note</label>
+                  <input id={`flow-note-${account.id}`} value={d.note || ''} placeholder="Optional"
+                    onChange={ev => setDraft(p => ({ ...p, [account.id]: { ...d, note: ev.target.value } }))} />
+                </div>
+              </div>
+              <button className="btn btn-ghost" type="button" style={{ marginTop: 10 }}
+                onClick={() => addFlow(account)} disabled={busy}>
+                <Plus size={15} /> Add cash flow
+              </button>
+            </div>
+          </section>
+        );
+      })}
+    </section>
+  );
+}
+
+
 function ImportSettings() {
   const [state, setState] = useState(null);
   const [draft, setDraft] = useState('');
@@ -848,6 +1133,7 @@ export default function Settings() {
           </div>
         )}
         {section === 'ai' && <AiSettings />}
+        {section === 'capital' && <CashFlowSettings />}
         {section === 'import' && <ImportSettings />}
         {section === 'backup' && <BackupSettings />}
       </div>

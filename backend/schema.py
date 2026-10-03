@@ -213,6 +213,22 @@ BASE_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_tags_group ON trade_tags(trade_group)",
     "CREATE INDEX IF NOT EXISTS idx_attachments_trade ON trade_attachments(trade_group, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_batches_account ON import_batches(account_id, id)",
+    # Deposits and withdrawals: the denominator for every equity ratio, and the
+    # one input a trade can never be (P&L is what the trades provide; capital is
+    # what was put in). Kept as rows rather than a total so each entry can be
+    # edited, deleted, reported on, and appended to by a future import.
+    """
+    CREATE TABLE IF NOT EXISTS account_cash_flows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id),
+        kind TEXT NOT NULL CHECK(kind IN ('deposit','withdrawal')),
+        amount REAL NOT NULL CHECK(amount > 0),
+        flow_date TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cash_flows_account ON account_cash_flows(account_id, flow_date)",
 ]
 
 
@@ -223,6 +239,11 @@ COLUMN_ADDITIONS = [
     "ALTER TABLE trade_analysis ADD COLUMN target_price REAL",
     "ALTER TABLE trade_analysis ADD COLUMN trade_rating INTEGER",
     "ALTER TABLE trade_analysis ADD COLUMN idea_source TEXT",
+    # Starting capital for the equity ratios (item 13). NULL, not 0: an account
+    # that has never been given a figure has an *unknown* denominator, and
+    # dividing by zero would report 100% loss for a flat account. NULL renders as
+    # "—" rather than as a number the user did not give.
+    "ALTER TABLE accounts ADD COLUMN starting_capital REAL",
     # What the cached Day Review was written from, so a trade or diary edit
     # marks it stale instead of leaving coaching text about a day that changed.
     "ALTER TABLE daily_summaries ADD COLUMN input_hash TEXT",

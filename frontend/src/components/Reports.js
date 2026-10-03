@@ -335,7 +335,14 @@ export default function Reports({ accountId }) {
                   { label: 'Net P&L', value: signed$(s.net_pnl), met: s.net_pnl >= 0,
                     read: `${s.green_days} green sessions against ${s.red_days} red` },
                   { label: 'Max drawdown', value: fmt$(s.max_drawdown), tone: 'neg',
-                    read: `Deepest on ${s.max_drawdown_date}` },
+                    read: s.max_drawdown_pct == null
+                      ? `Deepest on ${s.max_drawdown_date}`
+                      : `Deepest on ${s.max_drawdown_date} · ${Number(s.max_drawdown_pct).toFixed(2)}% of equity` },
+                  ...(s.return_pct == null ? [] : [{
+                    label: 'Return on equity', value: `${Number(s.return_pct).toFixed(2)}%`,
+                    met: s.return_pct >= 0,
+                    read: s.equity_base == null ? '' : `${signed$(s.net_pnl)} on ${fmt$(s.equity_base)}`,
+                  }]),
                   { label: 'Green days', value: `${s.green_days} / ${s.trading_days}`,
                     met: s.green_days > s.trading_days / 2,
                     read: `${Math.round(s.green_days / s.trading_days * 100)}% of sessions closed up` },

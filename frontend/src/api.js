@@ -11,6 +11,10 @@ export const accountsApi = {
   list: () => api.get('/api/accounts'),
   create: (data) => api.post('/api/accounts', data),
   update: (id, data) => api.put(`/api/accounts/${id}`, data),
+  cashFlows: (id) => api.get(`/api/accounts/${id}/cash-flows`),
+  addCashFlow: (id, data) => api.post(`/api/accounts/${id}/cash-flows`, data),
+  updateCashFlow: (id, flowId, data) => api.put(`/api/accounts/${id}/cash-flows/${flowId}`, data),
+  removeCashFlow: (id, flowId) => api.delete(`/api/accounts/${id}/cash-flows/${flowId}`),
 };
 
 export const tradesApi = {
