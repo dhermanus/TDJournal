@@ -19,9 +19,9 @@ const SECTIONS = [
 const COUNTED_SECTIONS = new Set(['strategy', 'source', 'tag']);
 
 const TAG_TYPE_LABEL = {
-  mistake: 'Mistakes', execution: 'Execution', setup: 'Setup', emotion: 'Emotion', outcome: 'Outcome',
+  mistake: 'Mistakes', execution: 'Execution', setup: 'Setup', emotion: 'Emotion', outcome: 'Outcome', market: 'Market condition',
 };
-const TAG_TYPE_ORDER = ['mistake', 'execution', 'setup', 'emotion', 'outcome'];
+const TAG_TYPE_ORDER = ['mistake', 'execution', 'setup', 'emotion', 'outcome', 'market'];
 
 const SECTION_COPY = {
   strategy: {

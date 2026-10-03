@@ -30,8 +30,10 @@ const TABS = [
 ];
 
 // Strategy and source tags mirror their own fields, so the tag report skips them.
-const TAG_TYPE_ORDER = ['mistake', 'execution', 'setup', 'emotion', 'outcome'];
-const TAG_TYPE_LABEL = { mistake: 'Mistakes', execution: 'Execution', setup: 'Setup', emotion: 'Emotion', outcome: 'Outcome' };
+// `market` appended, not inserted: it is the condition at entry (gap, trend,
+// relative volume) recorded per trade, and every other order here was chosen.
+const TAG_TYPE_ORDER = ['mistake', 'execution', 'setup', 'emotion', 'outcome', 'market'];
+const TAG_TYPE_LABEL = { mistake: 'Mistakes', execution: 'Execution', setup: 'Setup', emotion: 'Emotion', outcome: 'Outcome', market: 'Market condition' };
 
 function Section({ title, hint, children }) {
   return (

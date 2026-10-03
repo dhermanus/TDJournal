@@ -58,7 +58,7 @@ jest.mock('./api', () => {
       execution: [{ name: 'Scaled out', description: null, trades: 20, aliases: [] }],
       setup: [], emotion: [], outcome: [],
     },
-    tag_types: ['setup', 'execution', 'mistake', 'emotion', 'outcome'],
+    tag_types: ['setup', 'execution', 'mistake', 'emotion', 'outcome', 'market'],
   };
   // Anything not listed resolves with an empty object, which every page treats as "no data".
   const withDefault = (methods) => new Proxy(methods, {

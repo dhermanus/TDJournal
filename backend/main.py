@@ -42,7 +42,9 @@ from diary_matches import analyse_confidence, queued_for_review
 from daily_cache import daily_input_fingerprint, date_range_fingerprint
 from ai_usage import last_usage, forget_usage, friendly_error
 import ai_settings
-from library import router as library_router, init_library_tables, apply_aliases, library_names
+from library import (
+    router as library_router, init_library_tables, apply_aliases, library_names, TAG_TYPES,
+)
 import instruments
 import equity
 import mt5_time
@@ -1558,6 +1560,10 @@ def add_trade_tag(trade_group: str, data: TagCreate, conn: sqlite3.Connection = 
     trade = conn.execute("SELECT trade_group FROM trades WHERE trade_group=?", (trade_group,)).fetchone()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
+    if data.tag_type not in TAG_TYPES and data.tag_type not in ("strategy", "source"):
+        raise ValueError(f"Unknown tag type '{data.tag_type}'")
+    if not data.tag_value.strip():
+        raise ValueError("Tag value cannot be empty.")
     cursor = conn.execute(
         "INSERT INTO trade_tags (trade_group, tag_type, tag_value, source) VALUES (?,?,?,'manual')",
         (trade_group, data.tag_type, data.tag_value)
@@ -2964,7 +2970,7 @@ def get_reports(
     ).fetchall():
         tags_by_group.setdefault(tr['trade_group'], []).append((tr['tag_type'], tr['tag_value']))
     by_tag = {}
-    for tag_type in ('setup', 'execution', 'mistake', 'emotion', 'outcome'):
+    for tag_type in TAG_TYPES:
         rows_for_type = [
             dict(r, _tag=value)
             for r in raw

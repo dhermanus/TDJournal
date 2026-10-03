@@ -67,7 +67,7 @@ function EditTextarea({ label, value, onChange }) {
 
 const EMOTIONAL_STATES = ['Focused', 'Confident', 'Calm', 'Anxious', 'FOMO', 'Frustrated', 'Greedy', 'Fearful', 'Undisciplined', 'Overconfident'];
 const DEFAULT_SOURCES   = ['Watchlist', 'Scanner', 'Alert', 'News', 'Social Media', 'Own Research'];
-const TAG_TYPES = ['strategy', 'setup', 'execution', 'mistake', 'emotion', 'outcome', 'source'];
+const TAG_TYPES = ['strategy', 'setup', 'execution', 'mistake', 'emotion', 'outcome', 'source', 'market'];
 
 // ── Dropdown with add-new option ──────────────────────────────────────────────
 
@@ -128,6 +128,7 @@ const editGridStyle  = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,
 const TAG_CLASS = {
   strategy: 'accent', setup: '', execution: 'pos',
   mistake: 'neg', emotion: 'caution', outcome: 'accent', source: '',
+  market: 'caution',
 };
 
 function TagBadge({ tag, onDelete }) {

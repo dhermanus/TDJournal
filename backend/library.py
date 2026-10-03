@@ -23,7 +23,11 @@ router = APIRouter(prefix="/api/library")
 KINDS = ("strategy", "source", "tag")
 # Tag types that mirror the strategy / source fields rather than being tags.
 MIRRORED_TAG_TYPES = {"strategy": "strategy", "source": "source"}
-TAG_TYPES = ("setup", "execution", "mistake", "emotion", "outcome")
+# `market` is the condition at entry — gap-up/gap-down, trend, relative volume —
+# added for item 13 so Reports can ask "do I lose on gap-down opens?". It is
+# manual on purpose: this journal's bars are FX-only and it has no configured
+# price feed, so nothing here can infer a condition the trader did not record.
+TAG_TYPES = ("setup", "execution", "mistake", "emotion", "outcome", "market")
 
 
 def get_connection():
