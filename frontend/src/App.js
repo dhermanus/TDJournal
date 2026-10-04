@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import './index.css';
-import { accountsApi, kpisApi } from './api';
+import { accountsApi, kpisApi, authApi, setUnauthorizedHandler } from './api';
 import AppHeader from './components/AppHeader';
 import Dashboard from './components/Dashboard';
 import Trades from './components/Trades';
@@ -14,6 +14,7 @@ import DailySummary from './components/DailySummary';
 import Reports from './components/Reports';
 import Help from './components/Help';
 import Settings from './components/Settings';
+import LoginGate from './components/LoginGate';
 
 export default function App() {
   const [page, setPage] = useState('dashboard');
@@ -28,7 +29,10 @@ export default function App() {
   // trades on a weekend, a holiday, or any day before the market opens.
   const seededDate = useRef(false);
   useEffect(() => {
-    if (seededDate.current) return;
+    // Wait for /api/auth/status: firing during 'checking' is what made a
+    // logged-out reload log a 401 for a request the gate was about to refuse
+    // anyway. With auth off this is the same single call it has always been.
+    if (authState !== 'open' || seededDate.current) return;
     seededDate.current = true;
     kpisApi.get({})
       .then(r => {
@@ -39,14 +43,61 @@ export default function App() {
   }, []);
   const [brainOpen, setBrainOpen] = useState(false);
 
+  // 'checking' → 'open' (no auth) or 'required'. Nothing renders while checking:
+  // with auth off this lasts one request, and the app must not flash a login
+  // form at someone who is already signed in.
+  const [authState, setAuthState] = useState('checking');
+  const [authEnabled, setAuthEnabled] = useState(false);   // does this deployment want a password?
+  const [authBusy, setAuthBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    authApi.status()
+      .then(res => {
+        if (!alive) return;
+        setAuthEnabled(!!res.data?.required);
+        if (!res.data?.required) { setAuthState('open'); return; }
+        // A surviving cookie means the browser already has a valid session —
+        // show the app instead of prompting again on every reload.
+        setAuthState(res.data?.authenticated ? 'open' : 'required');
+      })
+      .catch(() => { if (alive) setAuthState('open'); });   // an API that cannot answer is not a lock
+    return () => { alive = false; };
+  }, []);
+
+  // Any 401 from anywhere in the app returns the user to the login screen.
+  useEffect(() => {
+    setUnauthorizedHandler(() => setAuthState('required'));
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  const handleSignOut = async () => {
+    try { await authApi.logout(); } catch (e) { /* the cookie is cleared below either way */ }
+    setAccounts([]);
+    setAuthState('required');
+  };
+
+  const handleLogin = async (password) => {
+    setAuthBusy(true);
+    try {
+      await authApi.login(password);
+      // The accounts effect re-runs when this flips to 'open', so no explicit
+      // refetch here — the old call would have run against the stale closure.
+      setAuthState('open');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
   const loadAccounts = useCallback(async () => {
+    if (authState !== 'open') return;   // never request data we cannot read
     try {
       const res = await accountsApi.list();
       setAccounts(res.data);
     } catch (e) {
       console.error('Failed to load accounts', e);
     }
-  }, []);
+  }, [authState]);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -75,6 +126,15 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      {authState === 'checking' && (
+        <main className="app-main" aria-busy="true">
+          <div className="skeleton" style={{ height: 180, margin: 24 }} />
+        </main>
+      )}
+      {authState === 'required' && (
+        <LoginGate status="required" onAuthenticated={handleLogin} busy={authBusy} />
+      )}
+      {authState === 'open' && <>
       <AppHeader
         page={page}
         onNavigate={navigate}
@@ -85,6 +145,7 @@ export default function App() {
         onAccountCreated={loadAccounts}
         brainOpen={brainOpen}
         onToggleBrain={() => setBrainOpen(v => !v)}
+        onSignOut={authEnabled && authState === 'open' ? handleSignOut : undefined}
       />
 
       <main className="app-main" id="main">
@@ -156,6 +217,7 @@ export default function App() {
           onSaved={handleTradeAdded}
         />
       )}
+      </>}
     </div>
   );
 }

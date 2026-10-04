@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager, contextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
@@ -49,6 +49,7 @@ import instruments
 import equity
 import mt5_time
 import backup
+import auth
 import import_batch
 
 load_dotenv()
@@ -58,6 +59,9 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # If a Docker/LAN operator asks for auth but forgot the password, refuse to
+    # boot instead of serving the API open. Local development has auth off by
+    # default and follows the exact same startup path it did before.
     init_db()
     _conn = get_db()
     try:
@@ -65,6 +69,14 @@ async def lifespan(app: FastAPI):
         # The selected model is read at request time by the AI call sites, which
         # have no connection, so it is loaded once here (and again on save).
         ai_settings.set_model(ai_settings.load_config(_conn)["model"])
+        # Once at startup: a per-installation key must not be regenerated per
+        # request, or every browser would be logged out on the next call.
+        if auth.is_required():
+            auth.require_configured(_conn)
+            app.state.auth_secret = auth.store_secret(_conn)
+            # Hash the configured password once; the persisted hash survives a
+            # container rebuild even if the operator removes TDJ_PASSWORD.
+            app.state.auth_password_hash = auth.get_or_create_password_hash(_conn)
     finally:
         _conn.close()
     Path(UPLOAD_DIR).mkdir(exist_ok=True)
@@ -128,6 +140,102 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Authentication ────────────────────────────────────────────────────────────
+#
+# Opt-in: with TDJ_AUTH unset every request passes through untouched, so local
+# development (launch.bat, npm start, all 425 backend tests) behaves exactly as
+# it did before this existed. The gate applies only to routes that can return or
+# change data — /api/* and /uploads/* — and deliberately leaves static SPA assets
+# alone, because the login screen itself has to load to be shown.
+
+def _auth_exempt(path: str) -> bool:
+    if not path.startswith(("/api/", "/uploads/")):
+        return True
+    return path.rstrip("/") in ("/api/auth/status", "/api/auth/login", "/api/auth/logout")
+
+
+@app.middleware("http")
+async def require_session(request: Request, call_next):
+    # CORS middleware answers preflight before the browser sends credentials; it
+    # contains no journal data, so it is exempt even when auth is on. The actual
+    # GET/POST that follows is still gated here.
+    if request.method == "OPTIONS" or not auth.is_required() or _auth_exempt(request.url.path):
+        return await call_next(request)
+
+    secret = getattr(request.app.state, "auth_secret", None)
+    if secret is None:
+        # Startup set auth up; without a key there is nothing to verify a cookie
+        # against, so fail closed rather than letting anything through.
+        return JSONResponse(status_code=503,
+                            content={"error": "Authentication is not initialised"})
+
+    token = request.cookies.get(auth.COOKIE_NAME, "")
+    if auth.verify(token, secret) is None:
+        path = request.url.path
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"error": "Sign in required"})
+        return JSONResponse(status_code=401, content={"error": "Sign in required"})
+
+    return await call_next(request)
+
+
+class AuthPayload(BaseModel):
+    password: str
+
+
+def _auth_cookie_valid(request: Request) -> bool:
+    secret = getattr(request.app.state, "auth_secret", None)
+    if secret is None:
+        return False
+    return auth.verify(request.cookies.get(auth.COOKIE_NAME, ""), secret) is not None
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    """Whether this deployment wants a password at all, and whether one is set.
+
+    `authenticated` answers from the actual signed cookie, so a reload keeps you
+    signed in and the frontend does not prompt again until the session expires.
+    It says nothing about the password itself — a wrong guess and an
+    unconfigured server must not be distinguishable from outside, or the response
+    becomes a probe for misconfigured containers.
+    """
+    enabled = auth.is_required()
+    return {"required": enabled, "authenticated": _auth_cookie_valid(request),
+            "method": "password"}
+
+
+@app.post("/api/auth/login")
+def auth_login(request: Request, body: AuthPayload):
+    if not auth.is_required():
+        raise HTTPException(status_code=400, detail="This deployment does not require sign-in.")
+    secret = getattr(request.app.state, "auth_secret", None)
+    stored = getattr(request.app.state, "auth_password_hash", "")
+    if secret is None or not stored or not auth.verify_password(body.password, stored):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+    # `secure` follows how the request arrived, so it works behind an HTTPS
+    # reverse proxy (Dockge) and still works over plain http://localhost.
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    response = JSONResponse(content={"authenticated": True})
+    response.set_cookie(
+        auth.COOKIE_NAME,
+        auth.make_session(secret),
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        max_age=auth.SESSION_TTL,
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    response = JSONResponse(content={"authenticated": False})
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
 
 # Serve uploaded diary screenshots (create the folder on first run)
 Path(UPLOAD_DIR).mkdir(exist_ok=True)

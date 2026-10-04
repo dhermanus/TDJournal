@@ -28,7 +28,7 @@ synthetic demo seed, not anyone's real trades.
 
 TDJournal is designed as a **local-first application**.
 
-Your trading journal database, imported broker data, notes, and uploaded files are stored locally on your computer. TDJournal does not require an account and does not include telemetry or analytics that send your usage data back to the project. The backend listens on `localhost` only.
+Your trading journal database, imported broker data, notes, and uploaded files are stored locally on your computer. TDJournal does not require an account and does not include telemetry or analytics that send your usage data back to the project. By default the backend listens on `localhost` only and does not require sign-in; for a Docker/Dockge or LAN deployment, enable password authentication with `TDJ_AUTH=required` and `TDJ_PASSWORD` as described in `.env.example`. Never expose an unauthenticated backend beyond localhost.
 
 ### What stays local
 
@@ -260,6 +260,7 @@ Everything is optional; the app runs without any keys and tells you exactly whic
 | `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | Intraday price charts on each trade (free Alpaca account works) |
 | `ALPACA_DATA_FEED` | Optional, defaults to `iex` (free-tier data). Set to `sip` only if your key has a paid market-data subscription. |
 | `FRONTEND_ORIGINS` | Optional. Any `localhost`/`127.0.0.1` port is already accepted; add comma-separated origins here only for a frontend served from another host. |
+| `TDJ_AUTH` / `TDJ_PASSWORD` | Optional, defaults off to preserve local development. For Docker/Dockge or any non-localhost use, set `TDJ_AUTH=required` and a strong password. Required auth without a password or stored hash refuses to start. |
 
 ## Make it yours with Claude Code
 

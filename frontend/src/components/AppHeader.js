@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, BarChart2, BookOpen, Plus, ChevronDown,
   CalendarDays, Check, X, Pencil, CalendarCheck, HelpCircle, Upload, Brain, Settings as SettingsIcon,
+  LogOut,
 } from 'lucide-react';
 import { accountsApi } from '../api';
 import aiJournalLogo from '../assets/ai-journal-logo.png';
@@ -225,6 +226,7 @@ function AccountMenu({ accounts, selectedAccountId, onSelectAccount, onAccountCr
 export default function AppHeader({
   page, onNavigate, accounts, selectedAccountId, onSelectAccount,
   onAddTrade, onAccountCreated, brainOpen, onToggleBrain,
+  onSignOut,
 }) {
   // Trade detail is reached from Trade View, so it keeps that tab highlighted.
   const activeId = page === 'trade-detail' ? 'trades' : page;
@@ -267,6 +269,15 @@ export default function AppHeader({
             onSelectAccount={onSelectAccount}
             onAccountCreated={onAccountCreated}
           />
+          {/* Only meaningful when the deployment asks for a password; absent
+              entirely when auth is off, so local development sees the same
+              header it always did. */}
+          {onSignOut && (
+            <button type="button" className="btn btn-ghost" onClick={onSignOut}
+              title="Sign out of this journal">
+              <LogOut size={16} aria-hidden="true" /> Sign out
+            </button>
+          )}
           <button
             type="button"
             className={`btn btn-ghost${page === 'import' ? ' active' : ''}`}

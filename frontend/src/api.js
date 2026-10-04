@@ -5,7 +5,33 @@ import { consumeBrainStream, bodyChunks } from './components/brainStream';
 // another origin (a second instance, a container, a LAN machine).
 export const API_BASE = (process.env.REACT_APP_API_URL ?? 'http://localhost:8010').replace(/\/+$/, '');
 
-const api = axios.create({ baseURL: API_BASE });
+// Cookies only ride along if the client says so: the dev server on :3010
+// calling the API on :8010 is a cross-origin request even though both are
+// localhost, and without this the login cookie would be dropped and every
+// request would 401 once TDJ_AUTH=required.
+const api = axios.create({ baseURL: API_BASE, withCredentials: true });
+
+// Not every caller can handle a 401 (the Brain stream is a raw fetch, and a
+// number of components just render). One handler routes all of them to the login
+// screen instead of leaving a half-rendered page behind.
+let onUnauthorized = () => {};
+export const setUnauthorizedHandler = (fn) => { onUnauthorized = typeof fn === 'function' ? fn : () => {}; };
+
+api.interceptors.response.use(
+  res => res,
+  (error) => {
+    if (error?.response?.status === 401 && !error?.config?.url?.includes('/api/auth/')) {
+      onUnauthorized();
+    }
+    return Promise.reject(error);
+  },
+);
+
+export const authApi = {
+  status: () => api.get('/api/auth/status'),
+  login: (password) => api.post('/api/auth/login', { password }),
+  logout: () => api.post('/api/auth/logout'),
+};
 
 export const accountsApi = {
   list: () => api.get('/api/accounts'),
@@ -107,6 +133,7 @@ export const brainApi = {
   stream: async (messages, accountId, { signal, onDelta } = {}) => {
     const res = await fetch(`${API_BASE}/api/brain/stream`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages, account_id: accountId }),
       signal,
