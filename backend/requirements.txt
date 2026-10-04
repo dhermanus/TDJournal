@@ -3,7 +3,7 @@ uvicorn[standard]==0.53.0
 python-multipart==0.0.32
 aiofiles==24.1.0
 httpx==0.28.1
-anthropic>=0.43.0
+anthropic>=1.11.0
 python-dotenv==1.2.3
 tzdata>=2024.1
 # Schema migrations run at startup (dbmigration.py). sqlalchemy is declared
