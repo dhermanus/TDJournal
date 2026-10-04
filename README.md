@@ -180,6 +180,30 @@ backend's CORS allow list. Any localhost port is accepted without configuration.
 Every install starts empty: no accounts, no trades, no demo data. Add your first account in the app,
 then import your broker's statement on the Import page.
 
+## Running it in Docker / Dockge
+
+The repository ships a `Dockerfile` and a `compose.yaml`. One image runs the API *and* serves the
+built frontend, so there is no second container and no CORS to configure — the browser talks to one
+origin.
+
+```bash
+echo "TDJ_PASSWORD=choose-a-strong-password" > .env
+docker compose up -d
+```
+
+The stack publishes `127.0.0.1:8010` by default, which is machine-local. Two things follow from
+that: **authentication is on** (`TDJ_AUTH=required` is set in `compose.yaml`, so the password above
+is enforced from the first start), and to reach it from another device you either change the left
+half of `ports:` to your LAN IP or put a reverse proxy / VPN in front. Do not publish it to
+`0.0.0.0` without a password — the API has no other protection.
+
+Your data lives in the `tdjournal-data` volume (journal, uploads, backups) and survives a
+`down`. To keep it in a folder you control instead, uncomment the bind mount in `compose.yaml`.
+On Mac/Linux with Apple Silicon you may need `platform: linux/amd64`.
+
+Local development is untouched by all of this: `setup.bat` and `launch.bat` keep working, and they
+never enter a container.
+
 ## Updating to a new release
 
 Your trades live in `backend/trading_journal.db` and your keys in `backend/.env`. Neither is part of

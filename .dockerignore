@@ -1,0 +1,39 @@
+# Everything the image does not need. Keeping these out keeps both the build
+# context small and — more importantly — secrets and data out of the image
+# layers entirely: a token or a journal inside a layer is readable by anyone
+# who pulls the image.
+
+# data
+*.db
+*.db-wal
+*.db-shm
+backend/uploads/
+backend/backups/
+uploads/
+backups/
+
+# secrets
+.env
+backend/.env
+.git-credentials
+
+# node / build
+node_modules/
+frontend/build/
+frontend/node_modules/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# source control and docs
+.git/
+.github/
+*.md
+docs/
+
+# The frontend source is copied through this context (stage 1: COPY frontend/),
+# so it is NOT excluded. Only its build outputs are — stage 1 rebuilds those.

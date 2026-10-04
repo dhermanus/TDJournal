@@ -1,0 +1,67 @@
+# TDJournal for Dockge / Docker Compose.
+#
+# Copy this folder into your stack (Dockge: Add Stack), or run
+# `docker compose -f compose.yaml up -d` next to the Dockerfile.
+#
+# Things worth reading before you start it:
+#
+#   * TDJ_AUTH=required is set below on purpose. Published on a LAN, the API has
+#     no other protection — anyone who can reach the port can read every trade
+#     and drive the export endpoints. Leave the password you set here in this
+#     file only if the file itself is protected; otherwise put it in an
+#     `env_file:` outside the stack directory.
+#   * The journal and uploads live in named volumes, so they survive a `down`
+#     and are not part of the image or the repository.
+#   * No ports are published by default: bind it to localhost and reach it
+#     through your reverse proxy/VPN, or add `ports:` under the service when you
+#     accept LAN exposure (then TDJ_AUTH must be required — it already is).
+
+name: tdjournal
+
+services:
+  tdjournal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tdjournal:latest
+    container_name: tdjournal
+    restart: unless-stopped
+
+    ports:
+      # "127.0.0.1:8010:8010" keeps it machine-local by default. Change the
+      # left-hand side to your LAN IP (e.g. 192.168.1.50:8010) or to
+      # "8010:8010" to listen on all interfaces — auth is already required.
+      - "127.0.0.1:8010:8010"
+
+    environment:
+      # Authentication: required + the password below. Remove TDJ_AUTH only for
+      # a container bound to localhost that you reach from your own browser.
+      TDJ_AUTH: "required"
+      TDJ_PASSWORD: ${TDJ_PASSWORD:?Set TDJ_PASSWORD in a .env file beside this compose file}
+      # The Anthropic key powers diary analysis, Day Review, Weekly Summary,
+      # Insights and the Brain chat. Optional; those features refuse without it.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Intraday price charts (free Alpaca account works).
+      APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
+      APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      # MT5 broker-server zone; historical daylight saving conversions use it.
+      MT5_SERVER_TIMEZONE: ${MT5_SERVER_TIMEZONE:-Europe/Athens}
+      # Not needed in this image: the API serves the frontend itself.
+      # FRONTEND_ORIGINS is left unset — same-origin means CORS never applies.
+
+    volumes:
+      - tdjournal-data:/data
+      # Uncomment to use an existing local journal instead of the named volume.
+      # The host folder must be writable by uid 1000 (the image runs unprivileged).
+      # - ./data:/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8010/',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  tdjournal-data:

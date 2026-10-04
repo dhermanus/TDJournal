@@ -173,9 +173,9 @@ async def require_session(request: Request, call_next):
 
     token = request.cookies.get(auth.COOKIE_NAME, "")
     if auth.verify(token, secret) is None:
-        path = request.url.path
-        if path.startswith("/api/"):
-            return JSONResponse(status_code=401, content={"error": "Sign in required"})
+        # Any gated path without a valid session, including /uploads/ downloads
+        # (bytes) and /api/* (data). The message is the same for both: a caller
+        # must not be able to distinguish "no session" from "wrong password".
         return JSONResponse(status_code=401, content={"error": "Sign in required"})
 
     return await call_next(request)
@@ -275,11 +275,45 @@ async def global_exception_handler(request, exc):
     )
 
 
-# ── Health check ───────────────────────────────────────────────────────────────
+# ── Built frontend (container mode) ──────────────────────────────────────────
+#
+# The Windows/local workflow never sets FRONTEND_DIR, so `npm start` keeps
+# serving the UI and `GET /` keeps answering {"status": "ok"} — same as before.
+# A container sets FRONTEND_DIR and gets the built SPA from this process, which
+# is why the same-origin deploy needs no CORS and no second web server.
+
+FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", "")) if os.getenv("FRONTEND_DIR") else None
+STATIC_DIR = FRONTEND_DIR / "static" if FRONTEND_DIR else None
+
+
+def _index_response() -> "Response":
+    if FRONTEND_DIR is None:
+        return JSONResponse({"status": "ok"})
+    index = FRONTEND_DIR / "index.html"
+    if not index.is_file():
+        # Fail visibly rather than serving an empty shell: a container missing
+        # its build step should not look like a working app with no data.
+        return JSONResponse(status_code=503,
+                            content={"error": "Frontend build not found in FRONTEND_DIR"})
+    return FileResponse(index, media_type="text/html")
+
+
+@app.get("/index.html", include_in_schema=False)
+def spa_index_alias():
+    return _index_response()
+
+
+# ── Health check / SPA root ─────────────────────────────────────────────────
 
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    """The built app, or the health JSON when no build is configured.
+
+    One route, not two: FastAPI answers a path with the first registration it
+    sees, so defining `/` here and again at the bottom of the file left the
+    earlier one winning and the SPA was never served.
+    """
+    return _index_response()
 
 
 # ── Goals ──────────────────────────────────────────────────────────────────────
@@ -3713,3 +3747,25 @@ async def brain_chat_stream(
     return StreamingResponse(events(), media_type="application/x-ndjson",
                              headers={"X-Accel-Buffering": "no",
                                       "Cache-Control": "no-cache"})
+
+
+if FRONTEND_DIR is not None:
+    # Registered after every /api and /uploads route above, so a missing API
+    # endpoint stays a 404 instead of becoming HTML that JSON callers choke on.
+    if (FRONTEND_DIR / "manifest.json").is_file():
+        @app.get("/manifest.json", include_in_schema=False)
+        def spa_manifest():
+            return FileResponse(FRONTEND_DIR / "manifest.json", media_type="application/manifest+json")
+    if (FRONTEND_DIR / "robots.txt").is_file():
+        @app.get("/robots.txt", include_in_schema=False)
+        def spa_robots():
+            return FileResponse(FRONTEND_DIR / "robots.txt", media_type="text/plain")
+    if (FRONTEND_DIR / "favicon.ico").is_file():
+        @app.get("/favicon.ico", include_in_schema=False)
+        def spa_favicon():
+            return FileResponse(FRONTEND_DIR / "favicon.ico", media_type="image/x-icon")
+
+    # CRA emits hashed files under static/, so this mount is content-addressed
+    # and safe to cache hard.
+    if STATIC_DIR and STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="spa_static")
