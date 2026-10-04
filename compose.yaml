@@ -1,22 +1,32 @@
-# TDJournal for Dockge / Docker Compose.
+# TDJournal — paste this whole file into Dockge: Add Stack → Editor.
 #
-# Copy this folder into your stack (Dockge: Add Stack), or run
-# `docker compose -f compose.yaml up -d` next to the Dockerfile.
+# ── Create the stack manually ────────────────────────────────────────────────
+#   1. Put the app source on the Dockge host. Either:
+#        a) git clone https://github.com/dhermanus/TDJournal
+#           /opt/appdata/dockge/stacks/tdjournal
+#          — then this file is the stack's compose.yaml, and `build:` below
+#            builds the image straight from that checkout; or
+#        b) put the source anywhere and build once from that folder:
+#             docker build -t tdjournal:latest /path/to/TDJournal
+#          — then delete the `build:` block below. The stack uses the image.
+#   2. In the same stack folder, create a file named `.env` with one line:
+#        TDJ_PASSWORD=choose-a-strong-password
+#      Compose reads it for ${...} substitution, so the password never appears
+#      in this YAML. Optional extras in the same file:
+#        ANTHROPIC_API_KEY=…   APCA_API_KEY_ID=…  APCA_API_SECRET_KEY=…
+#   3. Save the stack, then Start.
 #
-# Things worth reading before you start it:
-#
-#   * TDJ_AUTH=required is set below on purpose. Published on a LAN, the API has
-#     no other protection — anyone who can reach the port can read every trade
-#     and drive the export endpoints. Leave the password you set here in this
-#     file only if the file itself is protected; otherwise put it in an
-#     `env_file:` outside the stack directory.
-#   * The journal and uploads live in named volumes, so they survive a `down`
-#     and are not part of the image or the repository.
-#   * No ports are published by default: bind it to localhost and reach it
-#     through your reverse proxy/VPN, or add `ports:` under the service when you
-#     accept LAN exposure (then TDJ_AUTH must be required — it already is).
-
-name: tdjournal
+# ── Read before you start it ─────────────────────────────────────────────────
+#   * TDJ_AUTH=required is deliberate. On a LAN the API has no other protection
+#     — anyone who can reach the port can read every trade and drive the export
+#     endpoints. Do not remove it.
+#   * The port binds to 127.0.0.1 first, so a fresh stack is machine-local and
+#     reachable through your reverse proxy or VPN. To expose it to the LAN, edit
+#     the left-hand side only, e.g. "- 192.168.1.50:8010:8010" or
+#     "- 8010:8010" (all interfaces). The password must be set before you do.
+#   * Journal, uploads and backups live in a named volume, so a Stop/Start and a
+#     rebuild all keep your data. The commented bind mount below is the
+#     alternative if you would rather see the files on the host.
 
 services:
   tdjournal:
@@ -28,33 +38,27 @@ services:
     restart: unless-stopped
 
     ports:
-      # "127.0.0.1:8010:8010" keeps it machine-local by default. Change the
-      # left-hand side to your LAN IP (e.g. 192.168.1.50:8010) or to
-      # "8010:8010" to listen on all interfaces — auth is already required.
       - "127.0.0.1:8010:8010"
 
     environment:
-      # Authentication: required + the password below. Remove TDJ_AUTH only for
-      # a container bound to localhost that you reach from your own browser.
       TDJ_AUTH: "required"
-      TDJ_PASSWORD: ${TDJ_PASSWORD:?Set TDJ_PASSWORD in a .env file beside this compose file}
-      # The Anthropic key powers diary analysis, Day Review, Weekly Summary,
-      # Insights and the Brain chat. Optional; those features refuse without it.
+      # Compose fails here with a clear message if the .env file is missing —
+      # better than starting a stack nobody can reach.
+      TDJ_PASSWORD: ${TDJ_PASSWORD:?Create a .env file beside this compose file containing TDJ_PASSWORD=your-password}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # Intraday price charts (free Alpaca account works).
       APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
       APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      # MT5 broker-server zone; historical daylight saving conversions use it.
       MT5_SERVER_TIMEZONE: ${MT5_SERVER_TIMEZONE:-Europe/Athens}
-      # Not needed in this image: the API serves the frontend itself.
-      # FRONTEND_ORIGINS is left unset — same-origin means CORS never applies.
+      # Not set on purpose: the API serves the frontend itself, so both the
+      # browser and the API are the same origin and CORS never applies.
+      # FRONTEND_ORIGINS:
 
     volumes:
       - tdjournal-data:/data
-      # Uncomment to use an existing local journal instead of the named volume.
-      # The host folder must be writable by uid 1000 (the image runs unprivileged).
-      # - ./data:/data
+      # Existing journal on the host instead of the volume — the folder must be
+      # writable by uid 1000, which is how the image runs (unprivileged):
+      # - /path/to/existing/data:/data
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8010/',timeout=4).status==200 else 1)"]
