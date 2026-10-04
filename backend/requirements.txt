@@ -5,7 +5,7 @@ aiofiles==24.1.0
 httpx==0.28.1
 anthropic>=0.43.0
 python-dotenv==1.2.3
-tzdata>=2024.1
+tzdata>=2026.4
 # Schema migrations run at startup (dbmigration.py). sqlalchemy is declared
 # because migrations/env.py imports it directly, not only through alembic.
 alembic==1.20.0
