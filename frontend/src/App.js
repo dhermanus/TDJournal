@@ -25,6 +25,15 @@ export default function App() {
   const [selectedTrade, setSelectedTrade] = useState(null);
   const [tradeNavList, setTradeNavList] = useState([]);
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+
+  // 'checking' → 'open' (with auth off) or 'required' → 'open'. Nothing renders
+  // while checking: with auth off this lasts one request, and the app must not
+  // flash a login form at someone who is already signed in. Declared above the
+  // effect that waits on it, which reads authState in its dependency list.
+  const [authState, setAuthState] = useState('checking');
+  const [authEnabled, setAuthEnabled] = useState(false);   // does this deployment want a password?
+  const [authBusy, setAuthBusy] = useState(false);
+
   // Open Day Review on the most recent session, not on today. Today has no
   // trades on a weekend, a holiday, or any day before the market opens.
   const seededDate = useRef(false);
@@ -40,15 +49,8 @@ export default function App() {
         if (days.length) setSelectedDate(days[days.length - 1].date);
       })
       .catch(() => {});
-  }, []);
+  }, [authState]);
   const [brainOpen, setBrainOpen] = useState(false);
-
-  // 'checking' → 'open' (no auth) or 'required'. Nothing renders while checking:
-  // with auth off this lasts one request, and the app must not flash a login
-  // form at someone who is already signed in.
-  const [authState, setAuthState] = useState('checking');
-  const [authEnabled, setAuthEnabled] = useState(false);   // does this deployment want a password?
-  const [authBusy, setAuthBusy] = useState(false);
 
   useEffect(() => {
     let alive = true;

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, FileText, Image, CheckCircle, AlertCircle, CandlestickChart, RotateCcw } from 'lucide-react';
+import { Upload, FileText, Image, CheckCircle, AlertCircle, CandlestickChart } from 'lucide-react';
 import { importApi } from '../api';
 import { INSTRUMENT_TYPES } from '../instruments';
 import { PageHeader } from './ui';

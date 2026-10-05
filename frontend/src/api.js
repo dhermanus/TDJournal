@@ -127,8 +127,11 @@ export const brainApi = {
    * request is actually torn down instead of leaving the model to finish into
    * a socket nobody is reading.
    *
-   * Resolves to { text, ai_usage }. Rejects with { status, detail } so the
-   * caller can show the server's own words for a rate limit or a bad key.
+   * Resolves to { text, ai_usage }. Rejects with an Error carrying `.status`
+   * and `.detail` — the same two fields the caller reads — so it can show the
+   * server's own words for a rate limit or a bad key. It has to be an Error:
+   * eslint's no-throw-literal forbids throwing the plain object this used to
+   * be, and an Error keeps the message readable in the console.
    */
   stream: async (messages, accountId, { signal, onDelta } = {}) => {
     const res = await fetch(`${API_BASE}/api/brain/stream`, {
@@ -145,11 +148,19 @@ export const brainApi = {
         const body = await res.json();
         if (typeof body?.detail === 'string' && body.detail) detail = body.detail;
       } catch (e) { /* keep the status message */ }
-      throw { status: res.status, detail };
+      const error = new Error(detail);
+      error.status = res.status;
+      error.detail = detail;
+      throw error;
     }
 
     const chunks = bodyChunks(res);
-    if (!chunks) throw { status: 500, detail: 'This browser cannot stream the response.' };
+    if (!chunks) {
+      const error = new Error('This browser cannot stream the response.');
+      error.status = 500;
+      error.detail = error.message;
+      throw error;
+    }
     const { text, ai_usage: usage, failure } = await consumeBrainStream(chunks, { onDelta });
     if (failure && !text.trim()) throw failure;
     return { text, ai_usage: usage, ...(failure ? { failure } : {}) };
