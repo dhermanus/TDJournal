@@ -7,6 +7,7 @@ import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
 import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
 import { fillTs } from './chartTime';
+import { computeWhatIf, scenarioPrice } from './whatIf';
 import { parseExecs, computeStats, entryLeg, fmtHold, qtyLabel, legTime } from './tradeMetrics';
 
 const fmt$ = (v) => {
@@ -145,55 +146,13 @@ function TagBadge({ tag, onDelete }) {
   );
 }
 
-// ── What If helpers ───────────────────────────────────────────────────────────
+// ── What If ──────────────────────────────────────────────────────────────────
+//
+// The scenario arithmetic lives in ./whatIf so it can be asserted against the
+// chart's own timeline — the lookup here used to guess a timezone off the first
+// bar and read five hours past the exit. See whatIf.test.js.
 
 const TABS = ['Stats', 'Strategy', 'Tags', 'Executions', 'Files', 'What If'];
-
-const SCENARIOS = [
-  { label: '+5 min',    offsetMin: 5 },
-  { label: '+10 min',   offsetMin: 10 },
-  { label: '+30 min',   offsetMin: 30 },
-  { label: '+1 hour',   offsetMin: 60 },
-  { label: 'End of day', offsetMin: null },
-];
-
-function getPriceAt(bars, hhmm) {
-  if (!bars.length) return null;
-  const firstD = new Date(bars[0].t);
-  const firstUTCMin = firstD.getUTCHours() * 60 + firstD.getUTCMinutes();
-  const etOffset = firstUTCMin >= 780 ? -4 : -5;
-  const [h, m] = hhmm.split(':').map(Number);
-  const scenarioUTCMin = (h - etOffset) * 60 + m;
-  for (const bar of bars) {
-    const d = new Date(bar.t);
-    if (d.getUTCHours() * 60 + d.getUTCMinutes() >= scenarioUTCMin) return bar.c;
-  }
-  return bars[bars.length - 1].c;
-}
-
-function computeWhatIf(bars, stats, trade) {
-  if (!bars.length || !stats.isClosed || !stats.avgExit || !stats.closeTime) return null;
-  const [exitH, exitM] = stats.closeTime.split(':').map(Number);
-  const sideSign = trade.side === 'LONG' ? 1 : -1;
-
-  return SCENARIOS.map(({ label, offsetMin }) => {
-    let scenarioHHMM;
-    if (offsetMin === null) {
-      scenarioHHMM = '16:00';
-    } else {
-      const total = exitH * 60 + exitM + offsetMin;
-      scenarioHHMM = `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
-    }
-    const price = getPriceAt(bars, scenarioHHMM);
-    if (price == null) return { label, scenarioHHMM, price: null, deltaPnl: null, whatIfPnl: null };
-    // Withheld unless one price unit is worth one currency unit per quantity:
-    // for FX a 0.00250 move is $250, not $0.0025, so the arithmetic would lie.
-    const deltaPnl  = isPriceDeltaLinear(trade.instrument_type)
-      ? (price - stats.avgExit) * stats.totalQty * sideSign : null;
-    const whatIfPnl = deltaPnl != null ? (trade.net_pnl ?? 0) + deltaPnl : null;
-    return { label, scenarioHHMM, price, deltaPnl, whatIfPnl };
-  });
-}
 
 const EMPTY_EXEC = { action: 'BOT', qty: '', price: '0.00', commission: '0.00', date: '', time: '' };
 
@@ -284,7 +243,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
   const [editExecForm, setEditExecForm]   = useState(null);
   const [savingEditExec, setSavingEditExec] = useState(false);
 
-  // What If
+  // What If. Holds bars *and* the source they came in on: the timeline
+  // reconciliation in chartTime depends on which feed supplied them.
   const [whatIfBars, setWhatIfBars]       = useState(null);
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
@@ -468,13 +428,24 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
 
   useEffect(() => {
     if (whatIfBars !== null) return;
-    if (!stats.isClosed) { setWhatIfBars([]); return; }
+    // Same object shape on every path. Storing a bare array here left the
+    // guard above holding a non-null value that would never refetch, and the
+    // render reads `.bars` — so an open position that later closed would throw.
+    if (!stats.isClosed) { setWhatIfBars({ bars: [], source: null, warning: null }); return; }
     setWhatIfLoading(true);
-    chartApi.get(trade.ticker, trade.date, '1Min')
-      .then(r => setWhatIfBars(r.data.bars || []))
-      .catch(() => setWhatIfBars([]))
+    // From the *exit* date, not the trade row's date: a position closed on
+    // another day would otherwise anchor end-of-day and end-of-week to the
+    // wrong session (4 of 1,346 real positions span more than one day).
+    //
+    // days_forward reaches past the exit. The endpoint used to stop at the
+    // trade date, so end-of-week had no candle to answer with — the horizon
+    // was simply unanswerable. 5 days covers every Friday from any weekday.
+    const from = stats.closeDate || trade.date;
+    chartApi.get(trade.ticker, from, '1Min', 1, 5)
+      .then(r => setWhatIfBars({ bars: r.data.bars || [], source: r.data.source, warning: r.data.warning }))
+      .catch(() => setWhatIfBars({ bars: [], source: null, warning: null }))
       .finally(() => setWhatIfLoading(false));
-  }, [whatIfBars, trade.ticker, trade.date, stats.isClosed]);
+  }, [whatIfBars, trade.ticker, trade.date, stats.closeDate, stats.isClosed]);
 
   const pnl = trade.net_pnl ?? 0;
 
@@ -999,11 +970,16 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                   <div className="text-muted" style={{ fontSize: 14 }}>Available for closed trades only.</div>
                 ) : whatIfLoading ? (
                   <div className="text-muted" role="status" style={{ fontSize: 14 }}>Loading 1-min bar data…</div>
-                ) : whatIfBars !== null && whatIfBars.length === 0 ? (
-                  <div className="text-muted" style={{ fontSize: 14 }}>Chart data unavailable. Alpaca market data is required for this feature.</div>
+                ) : whatIfBars !== null && whatIfBars.bars.length === 0 ? (
+                  <div className="text-muted" style={{ fontSize: 14 }}>
+                    {/* The endpoint distinguishes "no bars in this window" from
+                        "no price feed configured" — say which, rather than
+                        blaming Alpaca for a symbol with no imported history. */}
+                    {whatIfBars.warning || 'No price bars for this instrument, so the horizons below cannot be answered.'}
+                  </div>
                 ) : whatIfBars !== null && (() => {
                   const canEstimate = isPriceDeltaLinear(trade.instrument_type);
-                  const scenarios = computeWhatIf(whatIfBars, stats, trade);
+                  const scenarios = computeWhatIf(whatIfBars.bars, stats, trade, whatIfBars.source);
                   if (!scenarios) return <div className="text-muted" style={{ fontSize: 14 }}>Insufficient trade data.</div>;
                   return (
                     <div>
@@ -1013,14 +989,15 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         </div>
                       )}
                       <div className="text-muted" style={{ marginBottom: 10, fontSize: 13 }}>
-                        Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>${stats.avgExit?.toFixed(2)}</strong>
+                        Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{scenarioPrice(stats.avgExit, trade)}</strong>
                         {' '}· Net P&L: <strong className={`num ${(trade.net_pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                       </div>
                       <table>
                         <thead>
                           <tr>
-                            <th className={undefined}>Scenario</th>
+                            <th>Scenario</th>
                             <th className={'num'}>Price</th>
+                            <th className={'num'}>At</th>
                             {canEstimate && <>
                               <th className={'num'}>Est. P&L</th>
                               <th className={'num'}>vs Actual</th>
@@ -1034,7 +1011,12 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                             return (
                               <tr key={i}>
                                 <td style={{ fontWeight: 500 }}>{s.label}</td>
-                                <td className="num">{s.price != null ? `$${s.price.toFixed(2)}` : '—'}</td>
+                                <td className="num">{scenarioPrice(s.price, trade)}</td>
+                                {/* Which bar the price came from. The original
+                                    table hid this, and reading five identical
+                                    "$1.19" rows is how the wrong-bar lookup went
+                                    unnoticed for a whole year. */}
+                                <td className="num text-muted" style={{ fontSize: 12.5 }}>{s.stamp || '—'}</td>
                                 {canEstimate && <>
                                   <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>
                                     {s.whatIfPnl != null ? fmtSigned$(s.whatIfPnl) : '—'}
@@ -1131,15 +1113,15 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           )}
 
           {/* What-if scenarios */}
-          {stats.isClosed && whatIfBars !== null && whatIfBars.length > 0 && (() => {
+          {stats.isClosed && whatIfBars !== null && whatIfBars.bars.length > 0 && (() => {
             const canEstimate = isPriceDeltaLinear(trade.instrument_type);
-            const scenarios = computeWhatIf(whatIfBars, stats, trade);
+            const scenarios = computeWhatIf(whatIfBars.bars, stats, trade, whatIfBars.source);
             if (!scenarios) return null;
             return (
               <section className="card">
                 <h2 className="section-title">What If Scenarios</h2>
                 <div className="text-muted" style={{ fontSize: 13, margin: '4px 0 12px' }}>
-                  Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>${stats.avgExit?.toFixed(2)}</strong>
+                  Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{scenarioPrice(stats.avgExit, trade)}</strong>
                   {' '}· Net P&L: <strong className={`num ${pnl >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                 </div>
                 {needsWhatIfCaveat(trade.instrument_type) && (
@@ -1151,8 +1133,9 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 <table>
                   <thead>
                     <tr>
-                      <th className={undefined}>Scenario</th>
+                      <th>Scenario</th>
                       <th className={'num'}>Price</th>
+                      <th className={'num'}>At</th>
                       {canEstimate && <>
                         <th className={'num'}>Est. P&L</th>
                         <th className={'num'}>vs Actual</th>
@@ -1166,7 +1149,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       return (
                         <tr key={i}>
                           <td style={{ fontWeight: 500 }}>{s.label}</td>
-                          <td className="num">{s.price != null ? `$${s.price.toFixed(2)}` : '—'}</td>
+                          <td className="num">{scenarioPrice(s.price, trade)}</td>
+                          <td className="num text-muted" style={{ fontSize: 12.5 }}>{s.stamp || '—'}</td>
                           {canEstimate && <>
                             <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>
                               {s.whatIfPnl != null ? fmtSigned$(s.whatIfPnl) : '—'}

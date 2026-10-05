@@ -53,6 +53,24 @@ export const isPriceDeltaLinear = (t) => {
 export const hasEquityChart = (t) => !t || t.toUpperCase() === 'STOCK';
 
 /**
+ * How many decimal places a *price* for this instrument is quoted at.
+ *
+ * Five-digit FX rendered through toFixed(2) collapsed an entire what-if table
+ * into five identical "$1.19" rows while the real prices spanned 1.19050–
+ * 1.19449 — four ten-thousandths from flipping the last row to "$1.20". The
+ * figure was correct; only the display was hiding it.
+ *
+ * Yen-quoted FX is three decimals (USDJPY ~148.250), everything else two.
+ */
+export const priceDecimals = (t, ticker) => {
+  const v = (t || 'STOCK').toUpperCase();
+  const pair = (ticker || '').toUpperCase();
+  if (v === 'FX') return /JPY$/.test(pair) ? 3 : 5;
+  if (v === 'METAL') return 2;
+  return 2;
+};
+
+/**
  * Whether the notice about an unreliable estimate should appear.
  * True when we display the scenario table without a usable delta.
  */
