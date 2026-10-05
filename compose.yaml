@@ -1,15 +1,15 @@
 # TDJournal — paste this whole file into Dockge: Add Stack → Editor.
 #
 # ── Create the stack manually ────────────────────────────────────────────────
-#   1. Put the app source on the Dockge host. Either:
+#   1. Put the app source in this stack's folder. Either:
 #        a) git clone https://github.com/dhermanus/TDJournal
-#           /opt/appdata/dockge/stacks/tdjournal
-#          — then this file is the stack's compose.yaml, and `build:` below
+#           /mnt/.ix-apps/app_mounts/dockge/stacks/tdjournal-stack
+#          — then this file is that folder's compose.yaml, and `build:` below
 #            builds the image straight from that checkout; or
 #        b) put the source anywhere and build once from that folder:
 #             docker build -t tdjournal:latest /path/to/TDJournal
 #          — then delete the `build:` block below. The stack uses the image.
-#   2. In the same stack folder, create a file named `.env` with one line:
+#   2. In the same folder, create a file named `.env` with one line:
 #        TDJ_PASSWORD=choose-a-strong-password
 #      Compose reads it for ${...} substitution, so the password never appears
 #      in this YAML. Optional extras in the same file:
@@ -20,13 +20,20 @@
 #   * TDJ_AUTH=required is deliberate. On a LAN the API has no other protection
 #     — anyone who can reach the port can read every trade and drive the export
 #     endpoints. Do not remove it.
-#   * The port binds to 127.0.0.1 first, so a fresh stack is machine-local and
-#     reachable through your reverse proxy or VPN. To expose it to the LAN, edit
-#     the left-hand side only, e.g. "- 192.168.1.50:8010:8010" or
-#     "- 8010:8010" (all interfaces). The password must be set before you do.
-#   * Journal, uploads and backups live in a named volume, so a Stop/Start and a
-#     rebuild all keep your data. The commented bind mount below is the
-#     alternative if you would rather see the files on the host.
+#   * The container always speaks 8010 — that is uvicorn's port, the Dockerfile's
+#     EXPOSE and the healthcheck below. Only the left-hand side of `ports` ever
+#     changes: 127.0.0.1:8010:8010 is machine-local (reachable through a reverse
+#     proxy or VPN); "192.168.1.50:8010:8010" or "8010:8010" reaches the whole LAN;
+#     a different host port like 7333 is just "127.0.0.1:7333:8010". The password
+#     must be set before you expose it. The healthcheck probes 8010 *inside* the
+#     container, so it reports healthy whatever the host port is — do not read a
+#     healthy badge as "the host port is open".
+#   * Journal, uploads and backups live on the pool at
+#     /mnt/tank/appdata/tdjournal/data, owned by uid 1000 — which is how the
+#     image runs (unprivileged). Stop/Start and rebuilds keep the data. The
+#     named volume is the alternative if you would rather Docker managed it:
+#     swap the two lines in `volumes:` and uncomment its declaration at the
+#     bottom of this file.
 
 services:
   tdjournal:
@@ -44,21 +51,19 @@ services:
       TDJ_AUTH: "required"
       # Compose fails here with a clear message if the .env file is missing —
       # better than starting a stack nobody can reach.
-      TDJ_PASSWORD: ${TDJ_PASSWORD:?Create a .env file beside this compose file containing TDJ_PASSWORD=your-password}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
-      APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      MT5_SERVER_TIMEZONE: ${MT5_SERVER_TIMEZONE:-Europe/Athens}
+      TDJ_PASSWORD: "${TDJ_PASSWORD:?Create a .env file beside this compose file containing TDJ_PASSWORD=your-password}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      APCA_API_KEY_ID: "${APCA_API_KEY_ID:-}"
+      APCA_API_SECRET_KEY: "${APCA_API_SECRET_KEY:-}"
+      ALPACA_DATA_FEED: "${ALPACA_DATA_FEED:-iex}"
+      MT5_SERVER_TIMEZONE: "${MT5_SERVER_TIMEZONE:-Europe/Athens}"
       # Not set on purpose: the API serves the frontend itself, so both the
       # browser and the API are the same origin and CORS never applies.
       # FRONTEND_ORIGINS:
 
     volumes:
-      - tdjournal-data:/data
-      # Existing journal on the host instead of the volume — the folder must be
-      # writable by uid 1000, which is how the image runs (unprivileged):
-      # - /path/to/existing/data:/data
+      - /mnt/tank/appdata/tdjournal/data:/data
+      # - tdjournal-data:/data
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8010/',timeout=4).status==200 else 1)"]
@@ -67,5 +72,6 @@ services:
       retries: 3
       start_period: 20s
 
-volumes:
-  tdjournal-data:
+# Only needed if you switch to the named volume above:
+# volumes:
+#   tdjournal-data:
