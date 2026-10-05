@@ -107,8 +107,12 @@ export const diaryApi = {
 };
 
 export const chartApi = {
-  get: (ticker, date, timeframe = '1Min', daysBack = 1) =>
-    api.get(`/api/chart/${encodeURIComponent(ticker)}/${date}`, { params: { timeframe, days_back: daysBack } }),
+  // daysForward widens the window past `date`. What-if's end-of-week horizon
+  // needs candles after the exit, and the endpoint's own default — back to the
+  // trade date — leaves nothing to answer it with.
+  get: (ticker, date, timeframe = '1Min', daysBack = 1, daysForward = 0) =>
+    api.get(`/api/chart/${encodeURIComponent(ticker)}/${date}`,
+      { params: { timeframe, days_back: daysBack, days_forward: daysForward } }),
 };
 
 export const calendarApi = {
@@ -127,11 +131,8 @@ export const brainApi = {
    * request is actually torn down instead of leaving the model to finish into
    * a socket nobody is reading.
    *
-   * Resolves to { text, ai_usage }. Rejects with an Error carrying `.status`
-   * and `.detail` — the same two fields the caller reads — so it can show the
-   * server's own words for a rate limit or a bad key. It has to be an Error:
-   * eslint's no-throw-literal forbids throwing the plain object this used to
-   * be, and an Error keeps the message readable in the console.
+   * Resolves to { text, ai_usage }. Rejects with { status, detail } so the
+   * caller can show the server's own words for a rate limit or a bad key.
    */
   stream: async (messages, accountId, { signal, onDelta } = {}) => {
     const res = await fetch(`${API_BASE}/api/brain/stream`, {
@@ -148,19 +149,11 @@ export const brainApi = {
         const body = await res.json();
         if (typeof body?.detail === 'string' && body.detail) detail = body.detail;
       } catch (e) { /* keep the status message */ }
-      const error = new Error(detail);
-      error.status = res.status;
-      error.detail = detail;
-      throw error;
+      throw { status: res.status, detail };
     }
 
     const chunks = bodyChunks(res);
-    if (!chunks) {
-      const error = new Error('This browser cannot stream the response.');
-      error.status = 500;
-      error.detail = error.message;
-      throw error;
-    }
+    if (!chunks) throw { status: 500, detail: 'This browser cannot stream the response.' };
     const { text, ai_usage: usage, failure } = await consumeBrainStream(chunks, { onDelta });
     if (failure && !text.trim()) throw failure;
     return { text, ai_usage: usage, ...(failure ? { failure } : {}) };

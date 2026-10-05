@@ -2502,7 +2502,7 @@ async def _fetch_alpaca_bars(client, url, base_params, headers, max_bars=5000):
 
 
 def _local_chart_bars(conn, ticker: str, date: str, timeframe: str,
-                      days_back: int) -> dict | None:
+                      days_back: int, days_forward: int = 0) -> dict | None:
     """Read and optionally aggregate imported M1 bars for a chart request.
 
     Returns None when the symbol has no local history (the caller may try the
@@ -2515,6 +2515,11 @@ def _local_chart_bars(conn, ticker: str, date: str, timeframe: str,
     Imported M1 times are naive UTC strings, so append `Z` and do no offset
     correction in the browser. Higher timeframes are aggregated from M1 bars
     in UTC buckets; no synthetic candles are filled across absent data.
+
+    `days_forward` widens the window past `date` and defaults to 0, so the
+    chart's own request is unchanged. What-if's end-of-week scenario needs
+    bars *after* the exit — the window used to stop at the trade date, which
+    is exactly why a forward-looking horizon could not be answered.
     """
     symbol = ticker.strip().upper()
     exists = conn.execute(
@@ -2529,12 +2534,13 @@ def _local_chart_bars(conn, ticker: str, date: str, timeframe: str,
     }
     wide_days = {"1Day": 3650, "1Week": 5475}
     days_back = min(days_back, wide_days.get(timeframe, 90))
+    days_forward = min(max(days_forward, 0), wide_days.get(timeframe, 90))
 
     try:
-        end_dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+        end_dt = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1 + days_forward)
     except ValueError:
         raise ValueError("Chart date must be YYYY-MM-DD")
-    start_dt = end_dt - timedelta(days=days_back)
+    start_dt = end_dt - timedelta(days=days_back + days_forward)
     start, end = start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     rows = conn.execute(
@@ -2596,10 +2602,11 @@ async def get_chart(
     ticker: str, date: str,
     timeframe: str = Query("5Min"),
     days_back: int = Query(1, ge=1),
+    days_forward: int = Query(0, ge=0),
     conn: sqlite3.Connection = Depends(get_connection),
 ):
     tf = timeframe if timeframe in ALLOWED_CHART_TIMEFRAMES else "5Min"
-    local = _local_chart_bars(conn, ticker, date, tf, days_back)
+    local = _local_chart_bars(conn, ticker, date, tf, days_back, days_forward)
     if local is not None:
         return local
 
@@ -2622,6 +2629,10 @@ async def get_chart(
     # daily bars is still only ~2500 rows.
     _WIDE_DAYS_BACK_CAP = {"1Day": 3650, "1Week": 5475}
     days_back = min(days_back, _WIDE_DAYS_BACK_CAP.get(tf, days_back)) if tf in _WIDE_RANGE_TIMEFRAMES else min(days_back, 90)
+    # Same ceiling as the local branch, so both providers answer from one window:
+    # a forward-looking what-if horizon reaches past the trade date, but a caller
+    # asking for it still cannot pull an unbounded run of history.
+    days_forward = min(max(days_forward, 0), _WIDE_DAYS_BACK_CAP.get(tf, 90))
 
     url = f"https://data.alpaca.markets/v2/stocks/{alpaca_ticker}/bars"
     if tf in _WIDE_RANGE_TIMEFRAMES:
@@ -2642,10 +2653,11 @@ async def get_chart(
         # instead of running off the edge of a single day's data.
         trade_day = datetime.strptime(date, "%Y-%m-%d").date()
         start_day = trade_day - timedelta(days=days_back - 1)
+        end_day = trade_day + timedelta(days=days_forward)
         params = {
             "timeframe": tf,
             "start": f"{start_day.isoformat()}T09:30:00-04:00",
-            "end": f"{date}T16:00:00-04:00",
+            "end": f"{end_day.isoformat()}T16:00:00-04:00",
             "limit": 1000,
             "feed": ALPACA_DATA_FEED,
             "adjustment": "raw",
