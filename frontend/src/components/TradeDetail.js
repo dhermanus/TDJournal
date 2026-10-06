@@ -160,6 +160,15 @@ function TagBadge({ tag, onDelete }) {
 
 const TABS = ['Stats', 'Strategy', 'Tags', 'Executions', 'Files', 'What If'];
 
+// Shown with the scenario table in both places it renders. The colour on Price
+// answers one question — did the price move your way by then — and nothing else,
+// so the note names what it leaves out rather than letting a green row read as
+// "this trade would have made money". Scoped to the price column because the
+// optional dollar columns below do multiply by position size.
+const WHAT_IF_COLOR_NOTE =
+  'Green and red on the price say only whether it rose or fell compared with your exit. '
+  + 'Position size, slippage, commissions and any swap charged for holding overnight are not counted.';
+
 const EMPTY_EXEC = { action: 'BOT', qty: '', price: '0.00', commission: '0.00', date: '', time: '' };
 
 // ── Main TradeDetail component ────────────────────────────────────────────────
@@ -999,6 +1008,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{fmtPrice(stats.avgExit, trade)}</strong>
                         {' '}· Net P&L: <strong className={`num ${(trade.net_pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                       </div>
+                      <div className="text-muted" style={{ marginBottom: 8, fontSize: 12.5 }}>{WHAT_IF_COLOR_NOTE}</div>
                       <table>
                         <thead>
                           <tr>
@@ -1013,15 +1023,15 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         </thead>
                         <tbody>
                           {scenarios.map((s, i) => {
-                            const better = s.deltaPnl != null && s.deltaPnl > 0;
-                            const worse  = s.deltaPnl != null && s.deltaPnl < 0;
+                            const better = s.better;
+                            const worse  = s.worse;
                             return (
                               <tr key={i}>
                                 <td style={{ fontWeight: 500 }}>{s.label}</td>
                                 {/* Direction drives the colour for every
                                     instrument, including FX where the dollar
                                     estimate below is withheld. */}
-                                <td className="num">{fmtPrice(s.price, trade)}</td>
+                                <td className={`num ${better ? 'pos' : worse ? 'neg' : ''}`} style={{ fontWeight: 600 }}>{fmtPrice(s.price, trade)}</td>
                                 {/* Which bar the price came from. The original
                                     table hid this, and reading five identical
                                     "$1.19" rows is how the wrong-bar lookup went
@@ -1139,6 +1149,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                     {whatIfCaveat(trade.instrument_type)}
                   </div>
                 )}
+                <div className="text-muted" style={{ fontSize: 12.5, margin: '-4px 0 8px' }}>{WHAT_IF_COLOR_NOTE}</div>
                 <div className="scroll-x" style={{ margin: '0 -24px', padding: '0 12px' }}>
                 <table>
                   <thead>
@@ -1154,12 +1165,12 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                   </thead>
                   <tbody>
                     {scenarios.map((s, i) => {
-                      const better = s.deltaPnl != null && s.deltaPnl > 0;
-                      const worse = s.deltaPnl != null && s.deltaPnl < 0;
+                      const better = s.better;
+                      const worse = s.worse;
                       return (
                         <tr key={i}>
                           <td style={{ fontWeight: 500 }}>{s.label}</td>
-                          <td className="num">{fmtPrice(s.price, trade)}</td>
+                          <td className={`num ${better ? 'pos' : worse ? 'neg' : ''}`} style={{ fontWeight: 600 }}>{fmtPrice(s.price, trade)}</td>
                           <td className="num text-muted" style={{ fontSize: 12.5 }}>{s.stamp || '—'}</td>
                           {canEstimate && <>
                             <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>

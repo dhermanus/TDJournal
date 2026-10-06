@@ -305,3 +305,74 @@ describe('price precision matches the instrument', () => {
     expect(scenarioPrice(null, fxTrade())).toBe('—');
   });
 });
+
+describe('every row says whether holding longer would have paid', () => {
+  // A rising series, exit partway through it, so later horizons are higher
+  // prices than the exit.
+  const rising = dayBars('2026-01-28');
+  const rows = computeWhatIf(rising, statsFor(), fxTrade(), 'local');
+  const plus5 = byLabel(rows, '+5 min');
+
+  test('the mark exists for FX, where the dollar estimate is withheld', () => {
+    // This is the point: FX cannot report Est. P&L (contract size is not on the
+    // row), but direction never needed it — qty is positive, so it cannot flip
+    // a sign. Color from direction is honest where a dollar figure would not be.
+    expect(plus5.deltaPnl).toBeNull();
+    expect(plus5.better).toBe(true);
+    expect(plus5.worse).toBe(false);
+    expect(rows.every(r => typeof r.better === 'boolean' && typeof r.worse === 'boolean')).toBe(true);
+  });
+
+  test('a longer hold that paid is better, one that cost is worse', () => {
+    expect(plus5.price).toBeGreaterThan(statsFor().avgExit);
+    expect(plus5.better).toBe(true);
+    expect(plus5.worse).toBe(false);
+  });
+
+  test('shorts invert: the same higher price is a worse exit for them', () => {
+    // The sign flip is what a naive implementation gets wrong. A short that
+    // was covered at 14:00 would have paid *less* at a higher price.
+    const shortRows = computeWhatIf(rising, statsFor(),
+      fxTrade({ side: 'SHORT', executions: JSON.stringify([
+        { date: '2026-01-28', time: '13:55:00', action: 'SOLD', qty: 2.77, price: 1.1954 },
+        { date: '2026-01-28', time: '14:00:00', action: 'BOT', qty: 2.77, price: 1.19568 },
+      ]) }), 'local');
+    const s5 = byLabel(shortRows, '+5 min');
+    expect(s5.price).toBe(plus5.price);          // same bar, same price
+    expect(s5.better).toBe(false);
+    expect(s5.worse).toBe(true);
+  });
+
+  test('a flat price is neither, so it takes no color', () => {
+    // Unchanged against the exit: neither green nor red. A row that always
+    // colored would be claiming a move that did not happen.
+    const flat = dayBars('2026-01-28').map(b => ({ ...b, c: statsFor().avgExit }));
+    const flatRows = computeWhatIf(flat, statsFor(), fxTrade(), 'local');
+    expect(flatRows.every(r => r.better === false && r.worse === false)).toBe(true);
+    expect(byLabel(flatRows, '+5 min').deltaPnl).toBeNull();   // still no dollars for FX
+  });
+
+  test('for stocks the direction and the dollar figure agree', () => {
+    const stock = fxTrade({ instrument_type: 'STOCK', ticker: 'AAPL' });
+    const s = computeWhatIf(rising, statsFor(), stock, 'local');
+    for (const row of s) {
+      if (row.deltaPnl == null) continue;
+      expect(row.deltaPnl > 0).toBe(row.better);
+      expect(row.deltaPnl < 0).toBe(row.worse);
+      // ...and the sign comes out right for a short there too.
+    }
+    const sShort = computeWhatIf(rising, statsFor(), { ...stock, side: 'SHORT' }, 'local');
+    const r5 = byLabel(sShort, '+5 min');
+    expect(r5.better).toBe(false);
+    expect(r5.deltaPnl).toBeLessThan(0);
+  });
+
+  test('a horizon with no bar cannot claim either direction', () => {
+    // Empty window: the row renders as a dash, so it must not also claim green.
+    const rows2 = computeWhatIf(dayBars('2026-01-19'), statsFor(), fxTrade(), 'local');
+    const eow = byLabel(rows2, 'End of week');
+    expect(eow.price).toBeNull();
+    expect(eow.better).toBe(false);
+    expect(eow.worse).toBe(false);
+  });
+});

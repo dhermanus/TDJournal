@@ -130,7 +130,13 @@ export function computeWhatIf(bars, stats, trade, source) {
       pick = insideWeek[insideWeek.length - 1];
     }
 
-    if (!pick) return { label, kind, price: null, deltaPnl: null, whatIfPnl: null, stamp: null };
+    // No bar at all: no price, and no claim in either direction. Leaving the
+    // flags out would render an undefined as false but leave `better` undefined
+    // for any caller that tests it directly.
+    if (!pick) {
+      return { label, kind, price: null, stamp: null, better: false, worse: false,
+               deltaPnl: null, whatIfPnl: null };
+    }
     if (kind !== 'offset') {
       // Name the bar actually read, not the boundary asked for: a week whose
       // Thursday was the last session answered with Thursday's close, and
@@ -138,14 +144,26 @@ export function computeWhatIf(bars, stats, trade, source) {
       stamp = dayOf(pick.ts);
     }
 
+    // Direction, always available. `(price - avgExit) * sideSign` is positive
+    // when holding longer would have paid, whatever the instrument: for FX the
+    // *dollar* figure below stays withheld (contract size is not on the row, so
+    // a client-side dollar amount would lie), but whether it went your way does
+    // not depend on contract size at all — qty is positive, so it cannot flip a
+    // sign. That is what lets a green/red mark appear for FX too.
+    const move = (pick.c - stats.avgExit) * sideSign;
+    const better = move > 0;
+    const worse = move < 0;
+
     // Withheld unless one price unit is worth one currency unit per quantity:
     // for FX a 0.00250 move is $250, not $0.0025, so the arithmetic would lie.
-    const deltaPnl = linear ? (pick.c - stats.avgExit) * stats.totalQty * sideSign : null;
+    const deltaPnl = linear ? move * stats.totalQty : null;
     return {
       label,
       kind,
       price: pick.c,
       stamp,
+      better,
+      worse,
       deltaPnl,
       whatIfPnl: deltaPnl != null ? (trade.net_pnl ?? 0) + deltaPnl : null,
     };
