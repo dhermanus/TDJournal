@@ -30,7 +30,7 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
   const previewPnl = () => {
     const entry = parseFloat(form.entry_price);
     const exit = parseFloat(form.exit_price);
-    const qty = parseInt(form.quantity);
+    const qty = Number(form.quantity);   // 0.01 stays 0.01; parseInt gave 0
     const comm = parseFloat(form.commissions) || 0;
     if (!entry || !exit || !qty) return null;
     const gross = form.side === 'LONG' ? (exit - entry) * qty : (entry - exit) * qty;
@@ -49,7 +49,7 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
       const payload = {
         ...form,
         ticker: form.ticker.toUpperCase(),
-        quantity: parseInt(form.quantity),
+        quantity: Number(form.quantity),
         commissions: parseFloat(form.commissions) || 0,
         entry_price: parseFloat(form.entry_price),
         exit_price: form.exit_price ? parseFloat(form.exit_price) : null,
@@ -138,7 +138,13 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
 
             <div>
               <label className="field-label" htmlFor="at-qty">Quantity</label>
-              <input id="at-qty" type="number" min="1" style={fieldStyle} value={form.quantity} onChange={e => update('quantity', e.target.value)} />
+              {/* min/step are 0.001, not 1: an FX lot is 0.01 and a micro-lot
+                  0.001, and a min of 1 inside a form element makes the browser
+                  reject the whole submit for any value under it — an FX trade
+                  could not be saved at all. JSX children take this form of
+                  comment; a // here would be parsed as text and its angle
+                  brackets as tags. */}
+              <input id="at-qty" type="number" min="0.001" step="0.001" style={fieldStyle} value={form.quantity} onChange={e => update('quantity', e.target.value)} />
             </div>
 
             <div>

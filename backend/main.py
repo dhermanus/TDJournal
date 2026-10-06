@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 import httpx
@@ -1248,7 +1248,13 @@ class TradeCreate(BaseModel):
     side: str
     entry_price: float
     exit_price: float | None = None
-    quantity: int = 1
+    # Fractional, not int: an FX lot is 0.01 and a micro-lot 0.001, and this
+    # journal holds 2,640 fractional fills against 63 whole ones — every FX trade
+    # in it came from the importer, which has always stored a float. Declaring
+    # int made the manual path reject with 422 int_from_float what the import
+    # path writes every day, so the two disagreed about what a quantity is.
+    # GT = Field constrains the type, so it rejects the cases a guard would.
+    quantity: float = Field(1, gt=0)
     commissions: float = 0.0
     strategy: str | None = None
     stop_loss: float | None = None
@@ -1260,13 +1266,38 @@ class TradeCreate(BaseModel):
     time: str | None = None
 
 
-def compute_manual_pnl(side: str, entry: float, exit_price: float | None, qty: int, commissions: float) -> tuple[float, float]:
+def compute_manual_pnl(side: str, entry: float, exit_price: float | None, qty: float,
+                       commissions: float, instrument_type: str = "STOCK",
+                       ticker: str | None = None) -> tuple[float, float]:
+    """Money a manual trade would have made, in the account's currency.
+
+    Multiplied by the instrument's unit value, exactly as the import path does
+    (`_recalculate_and_save`): one price unit is not one dollar for every
+    instrument — a 0.00044 move on a 0.01 EURUSD lot is $0.44 at 100,000 units
+    per lot, not $0.00. Without the multiplier the manual path reported zero for
+    an FX trade while the importer reported the same fill correctly, so which
+    number you got depended on how the trade entered the journal.
+
+    FUTURES_MULTIPLIERS is module-level (csv_parser), so passing nothing from
+    the route is the same input the import path gets.
+    """
     if exit_price is None:
         return 0.0, -commissions
     if side.upper() == 'LONG':
         gross = (exit_price - entry) * qty
     else:
         gross = (entry - exit_price) * qty
+    multiplier = instruments.units_per_lot(instrument_type, ticker, FUTURES_MULTIPLIERS)
+    if multiplier is None:
+        # Refuse rather than write a trade whose P&L is known to be wrong. A
+        # futures contract with no point value cannot be priced, and 0.0 in the
+        # journal is worse than an error: it reads as a flat trade rather than
+        # as a number we do not have. Same wording and rule as the import path.
+        raise ValueError(
+            f"no known point value for {ticker}; add a multiplier before "
+            f"this trade can be recomputed"
+        )
+    gross *= multiplier
     return round(gross, 2), round(gross - commissions, 2)
 
 
@@ -1345,7 +1376,8 @@ def create_trade(data: TradeCreate, conn: sqlite3.Connection = Depends(get_conne
         raise ValueError(f"Account {data.account_id} not found")
 
     gross_pnl, net_pnl = compute_manual_pnl(
-        data.side, data.entry_price, data.exit_price, data.quantity, data.commissions
+        data.side, data.entry_price, data.exit_price, data.quantity, data.commissions,
+        data.instrument_type, data.ticker,
     )
 
     # Build a manual trade group key
@@ -1483,11 +1515,19 @@ def _recalculate_and_save(trade: dict, execs: list, conn, trade_id: int):
 
 
 def _parse_exec_body(body: dict, fallback_date: str) -> dict:
+    # float, because a fill's quantity is 0.01 in an FX journal (see TradeCreate).
+    # Guarded: widening the type alone would let 0 through, which is an entry
+    # that never happened, and a negative one, which would silently flip the sign
+    # of the P&L it feeds. ValueError reaches the handler as a 400 rather than
+    # being written into the journal and found during the invariant test.
+    qty = float(body['qty'])
+    if qty <= 0:
+        raise ValueError("Quantity must be greater than zero.")
     return {
         'date': body.get('date', fallback_date),
         'time': body.get('time', ''),
         'action': body['action'].upper(),
-        'qty': int(body['qty']),
+        'qty': qty,
         'price': float(body['price']),
         'commission': float(body.get('commission', 0)),
     }

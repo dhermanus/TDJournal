@@ -886,7 +886,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Qty</div>
-                        <input aria-label="Edit execution qty" type="number" min="1" value={editExecForm.qty} onChange={e => setEditExecForm(f => ({ ...f, qty: e.target.value }))} style={inputStyle} />
+                        <input aria-label="Edit execution qty" type="number" min="0.001" step="0.001" value={editExecForm.qty} onChange={e => setEditExecForm(f => ({ ...f, qty: e.target.value }))} style={inputStyle} />
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Price</div>
@@ -936,7 +936,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Qty</div>
-                        <input aria-label="New execution qty" type="number" min="1" value={execForm.qty} placeholder="0" onChange={e => setExecForm(f => ({ ...f, qty: e.target.value }))} style={inputStyle} />
+                        <input aria-label="New execution qty" type="number" min="0.001" step="0.001" value={execForm.qty} placeholder="0" onChange={e => setExecForm(f => ({ ...f, qty: e.target.value }))} style={inputStyle} />
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Price</div>
