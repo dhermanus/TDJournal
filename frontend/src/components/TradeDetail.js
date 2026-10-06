@@ -5,9 +5,9 @@ import AttachmentsPanel from './AttachmentsPanel';
 import useFilePaste from '../useFilePaste';
 import TradingChart from './TradingChart';
 import { PageHeader, KpiStrip, KpiCell, MoneyValue, PanelHead } from './ui';
-import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel } from '../instruments';
+import { isPriceDeltaLinear, needsWhatIfCaveat, whatIfCaveat, instrumentLabel, fmtPrice, priceStep } from '../instruments';
 import { fillTs } from './chartTime';
-import { computeWhatIf, scenarioPrice } from './whatIf';
+import { computeWhatIf } from './whatIf';
 import { parseExecs, computeStats, entryLeg, fmtHold, qtyLabel, legTime } from './tradeMetrics';
 
 const fmt$ = (v) => {
@@ -40,7 +40,13 @@ const inputStyle = {
   width: '100%', fontSize: 14, minHeight: 34, padding: '5px 9px', boxSizing: 'border-box',
 };
 
-function EditField({ label, value, onChange, type = 'text', options }) {
+function EditField({ label, value, onChange, type = 'text', options, step }) {
+  // `step` matters for type=number: its default is 1, so a decimal price is a
+  // step mismatch. Harmless while these inputs sit outside a form (TradeDetail
+  // has none, so constraint validation never runs), but a form wrap would
+  // silently reject the value. Comment lives here, not inside the JSX: a
+  // `{/* ... */}` block in front of the `<input>` inside those parens is two
+  // expressions where JSX wants one, and does not parse.
   return (
     <label style={{ display: 'block' }}>
       <span className="field-label" style={{ marginBottom: 4 }}>{label}</span>
@@ -50,7 +56,7 @@ function EditField({ label, value, onChange, type = 'text', options }) {
           {options.map(o => <option key={o} value={o}>{o}</option>)}
         </select>
       ) : (
-        <input type={type} value={value} onChange={e => onChange(e.target.value)} style={inputStyle} />
+        <input type={type} step={step} value={value} onChange={e => onChange(e.target.value)} style={inputStyle} />
       )}
     </label>
   );
@@ -538,8 +544,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
           tone={analysis?.r_multiple != null ? (analysis.r_multiple >= 0 ? 'pos' : 'neg') : undefined}
           foot={plannedR ? <>Planned <span className="num">{plannedR}</span></> : null}
         />
-        <KpiCell label="Avg entry" value={<span className="num">{stats.avgEntry ? `$${stats.avgEntry.toFixed(2)}` : 'n/a'}</span>} />
-        <KpiCell label="Avg exit" value={<span className="num">{stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : 'n/a'}</span>} />
+        <KpiCell label="Avg entry" value={<span className="num">{stats.avgEntry ? fmtPrice(stats.avgEntry, trade) : 'n/a'}</span>} />
+        <KpiCell label="Avg exit" value={<span className="num">{stats.avgExit ? fmtPrice(stats.avgExit, trade) : 'n/a'}</span>} />
         <KpiCell label="Quantity" value={<span className="num">{stats.totalQty || 'n/a'}</span>} foot={trade.commissions ? <>Comm <span className="num">{fmt$(trade.commissions)}</span></> : null} />
         <KpiCell label="Risk" value={<span className="num">{tradeRisk ? fmt$(tradeRisk) : 'n/a'}</span>} />
       </KpiStrip>
@@ -555,6 +561,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
             <TradingChart
               ticker={trade.ticker}
               date={trade.date}
+              instrumentType={trade.instrument_type}
               executions={parseExecs(trade)}
               side={trade.side}
               analysis={analysis}
@@ -627,8 +634,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                 {stats.netRoi != null && <StatRow label="Net ROI" value={`${stats.netRoi >= 0 ? '+' : ''}${stats.netRoi.toFixed(2)}%`} valueColor={stats.netRoi >= 0 ? 'var(--green)' : 'var(--red)'} />}
                 <StatRow label="Gross P&L" value={trade.gross_pnl != null ? fmt$(trade.gross_pnl) : '—'} valueColor={trade.gross_pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
                 {stats.adjustedCost != null && <StatRow label="Adjusted Cost" value={fmt$(stats.adjustedCost)} />}
-                <StatRow label="Average Entry" value={stats.avgEntry ? `$${stats.avgEntry.toFixed(2)}` : '—'} />
-                <StatRow label="Average Exit" value={stats.avgExit ? `$${stats.avgExit.toFixed(2)}` : '—'} />
+                <StatRow label="Average Entry" value={stats.avgEntry ? fmtPrice(stats.avgEntry, trade) : '—'} />
+                <StatRow label="Average Exit" value={stats.avgExit ? fmtPrice(stats.avgExit, trade) : '—'} />
                 <StatRow label="Entry Time" value={legTime(stats.openDate, stats.openTime, trade.date) || '—'} />
                 <StatRow label="Exit Time" value={(stats.isClosed && legTime(stats.closeDate, stats.closeTime, trade.date)) || '—'} />
                 <StatRow label="Hold Time" value={fmtHold(stats.holdMinutes)} />
@@ -655,8 +662,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         placeholder="Select source"
                       />
                     </div>
-                    <EditField label="Stop Loss ($)" type="number" value={String(statsForm.stop_loss)} onChange={v => setStatsForm(f => ({ ...f, stop_loss: v }))} />
-                    <EditField label="Profit Target ($)" type="number" value={String(statsForm.target_price)} onChange={v => setStatsForm(f => ({ ...f, target_price: v }))} />
+                    <EditField label="Stop Loss ($)" type="number" step={priceStep(trade.instrument_type, trade.ticker)} value={String(statsForm.stop_loss)} onChange={v => setStatsForm(f => ({ ...f, stop_loss: v }))} />
+                    <EditField label="Profit Target ($)" type="number" step={priceStep(trade.instrument_type, trade.ticker)} value={String(statsForm.target_price)} onChange={v => setStatsForm(f => ({ ...f, target_price: v }))} />
                     <EditField label="R Multiple" type="number" value={String(statsForm.r_multiple)} onChange={v => setStatsForm(f => ({ ...f, r_multiple: v }))} />
                     <EditField label="Emotional State" value={statsForm.emotional_state} onChange={v => setStatsForm(f => ({ ...f, emotional_state: v }))} options={EMOTIONAL_STATES} />
                   </div>
@@ -664,8 +671,8 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                   <>
                     <StatRow label="Strategy" value={analysis.strategy} valueColor="var(--accent-line)" />
                     <StatRow label="Source" value={analysis.idea_source} valueColor="var(--text-secondary)" />
-                    <StatRow label="Stop Loss" value={analysis.stop_loss ? `$${analysis.stop_loss}` : null} valueColor="var(--caution)" />
-                    <StatRow label="Profit Target" value={analysis.target_price ? `$${analysis.target_price}` : null} valueColor="var(--accent-line)" />
+                    <StatRow label="Stop Loss" value={analysis.stop_loss ? fmtPrice(analysis.stop_loss, trade) : null} valueColor="var(--caution)" />
+                    <StatRow label="Profit Target" value={analysis.target_price ? fmtPrice(analysis.target_price, trade) : null} valueColor="var(--accent-line)" />
                     <StatRow label="Trade Risk" value={tradeRisk ? fmt$(tradeRisk) : (analysis.risk_per_trade ? fmt$(-Math.abs(analysis.risk_per_trade)) : null)} valueColor="var(--caution)" />
                     <StatRow label="Planned R-Multiple" value={plannedR} />
                     <StatRow label="Realized R-Multiple" value={realizedR} valueColor={analysis?.r_multiple >= 0 ? 'var(--green)' : 'var(--red)'} />
@@ -825,7 +832,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         <td className="mono" style={{ fontSize: 13.5, whiteSpace: 'nowrap' }}>{ex.time?.slice(0, 5) || '—'}</td>
                         <td style={{ whiteSpace: 'nowrap' }}>{ex.action}</td>
                         <td className="num mono" style={{ fontSize: 13.5 }}>{ex.qty}</td>
-                        <td className="num mono" style={{ fontSize: 13.5 }}>${Number(ex.price ?? 0).toFixed(2)}</td>
+                        <td className="num mono" style={{ fontSize: 13.5 }}>{fmtPrice(ex.price, trade)}</td>
                         <td className="num mono text-muted" style={{ fontSize: 13.5 }}>{ex.commission ? `$${Number(ex.commission).toFixed(2)}` : '—'}</td>
                         <td className="num" style={{ whiteSpace: 'nowrap', paddingRight: 20 }}>
                           <button
@@ -874,7 +881,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Price</div>
-                        <input aria-label="Edit execution price" type="number" min="0" step="0.01" value={editExecForm.price} onChange={e => setEditExecForm(f => ({ ...f, price: e.target.value }))} style={inputStyle} />
+                        <input aria-label="Edit execution price" type="number" min="0" step={priceStep(trade.instrument_type, trade.ticker)} value={editExecForm.price} onChange={e => setEditExecForm(f => ({ ...f, price: e.target.value }))} style={inputStyle} />
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Commission</div>
@@ -924,7 +931,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Price</div>
-                        <input aria-label="New execution price" type="number" min="0" step="0.01" value={execForm.price} onChange={e => setExecForm(f => ({ ...f, price: e.target.value }))} style={inputStyle} />
+                        <input aria-label="New execution price" type="number" min="0" step={priceStep(trade.instrument_type, trade.ticker)} value={execForm.price} onChange={e => setExecForm(f => ({ ...f, price: e.target.value }))} style={inputStyle} />
                       </div>
                       <div>
                         <div className="field-label" style={{ marginBottom: 4 }}>Commission</div>
@@ -989,7 +996,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                         </div>
                       )}
                       <div className="text-muted" style={{ marginBottom: 10, fontSize: 13 }}>
-                        Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{scenarioPrice(stats.avgExit, trade)}</strong>
+                        Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{fmtPrice(stats.avgExit, trade)}</strong>
                         {' '}· Net P&L: <strong className={`num ${(trade.net_pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                       </div>
                       <table>
@@ -1011,7 +1018,10 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                             return (
                               <tr key={i}>
                                 <td style={{ fontWeight: 500 }}>{s.label}</td>
-                                <td className="num">{scenarioPrice(s.price, trade)}</td>
+                                {/* Direction drives the colour for every
+                                    instrument, including FX where the dollar
+                                    estimate below is withheld. */}
+                                <td className="num">{fmtPrice(s.price, trade)}</td>
                                 {/* Which bar the price came from. The original
                                     table hid this, and reading five identical
                                     "$1.19" rows is how the wrong-bar lookup went
@@ -1121,7 +1131,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
               <section className="card">
                 <h2 className="section-title">What If Scenarios</h2>
                 <div className="text-muted" style={{ fontSize: 13, margin: '4px 0 12px' }}>
-                  Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{scenarioPrice(stats.avgExit, trade)}</strong>
+                  Actual exit: <strong className="num" style={{ color: 'var(--text-primary)' }}>{stats.closeTime?.slice(0, 5)}</strong> @ <strong className="num" style={{ color: 'var(--text-primary)' }}>{fmtPrice(stats.avgExit, trade)}</strong>
                   {' '}· Net P&L: <strong className={`num ${pnl >= 0 ? 'pos' : 'neg'}`}>{fmtSigned$(trade.net_pnl)}</strong>
                 </div>
                 {needsWhatIfCaveat(trade.instrument_type) && (
@@ -1149,7 +1159,7 @@ export default function TradeDetail({ trade: initialTrade, tradeNavList = [], on
                       return (
                         <tr key={i}>
                           <td style={{ fontWeight: 500 }}>{s.label}</td>
-                          <td className="num">{scenarioPrice(s.price, trade)}</td>
+                          <td className="num">{fmtPrice(s.price, trade)}</td>
                           <td className="num text-muted" style={{ fontSize: 12.5 }}>{s.stamp || '—'}</td>
                           {canEstimate && <>
                             <td className={`num ${s.whatIfPnl != null ? (s.whatIfPnl >= 0 ? 'pos' : 'neg') : 'text-muted'}`} style={{ fontWeight: 600 }}>

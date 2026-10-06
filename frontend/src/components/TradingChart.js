@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { createChart, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { chartApi } from '../api';
 import { toTs, fillTs, axisLabel } from './chartTime';
+import { priceDecimals } from '../instruments';
 
 // lightweight-charts paints to canvas and cannot resolve CSS var(), so colours
 // are read from the design tokens at render time. Fallbacks are the token values.
@@ -97,6 +98,7 @@ export default function TradingChart({
   ticker, date, defaultTimeframe = '5Min',
   executions = [], side = 'LONG', analysis = null,
   height = 320,
+  instrumentType = 'STOCK',
 }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -234,6 +236,16 @@ export default function TradingChart({
       borderDownColor: T.down,
       wickUpColor: T.up,
       wickDownColor: T.down,
+      // Without this the axis defaults to two decimals, which renders a 1.15298
+      // EURUSD print as "1.15" on every tick label — the axis then disagrees
+      // with the entry/exit lines drawn over it, which are priced at full
+      // precision. minMove is the same unit priceDecimals describes, so the
+      // labels can only show values the instrument actually trades on.
+      priceFormat: {
+        type: 'price',
+        precision: priceDecimals(instrumentType, ticker),
+        minMove: 1 / 10 ** priceDecimals(instrumentType, ticker),
+      },
     });
 
     const candleData = bars.map(b => ({
@@ -347,7 +359,10 @@ export default function TradingChart({
             position: isBuy ? 'belowBar' : 'aboveBar',
             color: isBuy ? T.up : T.down,
             shape: isBuy ? 'arrowUp' : 'arrowDown',
-            text: `${f.qty}@${f.price}`,
+            // Full precision, same `qty@price` shape it has always had: the
+            // chart axis above now labels in these digits too, so a marker
+            // reading "1.15" under a "1.15298" axis would disagree with it.
+            text: `${f.qty}@${Number(f.price).toFixed(priceDecimals(instrumentType, ticker))}`,
           };
         })
         .filter(Boolean)
@@ -422,7 +437,7 @@ export default function TradingChart({
       chart.remove();
       chartRef.current = null;
     };
-  }, [bars, executions, side, analysis, height, loading, date, timeframe, isWide, daysBack, source]);
+  }, [bars, executions, side, analysis, height, loading, date, timeframe, isWide, daysBack, source, instrumentType, ticker]);
 
   useEffect(() => {
     visibleRef.current = visible;

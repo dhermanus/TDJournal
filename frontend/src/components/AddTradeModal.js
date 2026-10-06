@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { X } from 'lucide-react';
 import { tradesApi } from '../api';
-import { INSTRUMENT_TYPES, INSTRUMENT_LABELS } from '../instruments';
+import { INSTRUMENT_TYPES, INSTRUMENT_LABELS, priceStep } from '../instruments';
 import useModalFocus from './useModalFocus';
 
 export default function AddTradeModal({ accounts, defaultAccountId, onClose, onSaved }) {
@@ -128,12 +128,12 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
 
             <div>
               <label className="field-label" htmlFor="at-entry">Entry Price</label>
-              <input id="at-entry" type="number" step="0.01" style={fieldStyle} placeholder="0.00" value={form.entry_price} onChange={e => update('entry_price', e.target.value)} required />
+              <input id="at-entry" type="number" step={priceStep(form.instrument_type, form.ticker)} style={fieldStyle} placeholder="0.00" value={form.entry_price} onChange={e => update('entry_price', e.target.value)} required />
             </div>
 
             <div>
               <label className="field-label" htmlFor="at-exit">Exit Price</label>
-              <input id="at-exit" type="number" step="0.01" style={fieldStyle} placeholder="0.00 (optional)" value={form.exit_price} onChange={e => update('exit_price', e.target.value)} />
+              <input id="at-exit" type="number" step={priceStep(form.instrument_type, form.ticker)} style={fieldStyle} placeholder="0.00 (optional)" value={form.exit_price} onChange={e => update('exit_price', e.target.value)} />
             </div>
 
             <div>
@@ -148,7 +148,7 @@ export default function AddTradeModal({ accounts, defaultAccountId, onClose, onS
 
             <div>
               <label className="field-label" htmlFor="at-stop">Stop Loss</label>
-              <input id="at-stop" type="number" step="0.01" style={fieldStyle} placeholder="Price level" value={form.stop_loss} onChange={e => update('stop_loss', e.target.value)} />
+              <input id="at-stop" type="number" step={priceStep(form.instrument_type, form.ticker)} style={fieldStyle} placeholder="Price level" value={form.stop_loss} onChange={e => update('stop_loss', e.target.value)} />
             </div>
 
             <div>

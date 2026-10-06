@@ -71,6 +71,37 @@ export const priceDecimals = (t, ticker) => {
 };
 
 /**
+ * A quoted price at the precision the instrument trades at.
+ *
+ * Lives here rather than with any one view, because it answers a question the
+ * whole UI shares: a EURUSD entry at 1.15298 and an exit at 1.15283 both read
+ * "$1.15" through `toFixed(2)` — identical — and the point of showing two
+ * columns is the difference between them.
+ *
+ * `null`/undefined/empty renders as a dash. `Number('')` is 0 rather than NaN,
+ * so the empty case has to be checked before it — otherwise a cleared input
+ * shows `$0.00000`, a value we never observed.
+ */
+export const fmtPrice = (price, trade) =>
+  price === null || price === undefined || price === '' || Number.isNaN(Number(price))
+    ? '—'
+    : `$${Number(price).toFixed(priceDecimals(trade.instrument_type, trade.ticker))}`;
+
+/**
+ * The `step` a price input should offer.
+ *
+ * `<input type="number" step="0.01">` does not merely suggest a granularity —
+ * the browser rejects the *whole form* on submit if the value is not a multiple
+ * of the step. A EURUSD entry of 1.15300 therefore could not be added at all
+ * through Add Trade, which is a broken field rather than a formatting choice.
+ *
+ * Derived from priceDecimals, so the two can never disagree. Any step ≤ the
+ * precision works for the browser's check; the smallest whole unit of the
+ * quoted price is the obvious one.
+ */
+export const priceStep = (t, ticker) => 1 / 10 ** priceDecimals(t, ticker);
+
+/**
  * Whether the notice about an unreliable estimate should appear.
  * True when we display the scenario table without a usable delta.
  */

@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { X } from 'lucide-react';
 import { calendarApi } from '../api';
+import { fmtPrice, priceStep } from '../instruments';
 import {
   Measures, BarRow, Tabs, Seg, EquityCurve, SessionStrip, MonthGrid,
   money, money2, moneyK, tone, shortDate, MONTH_NAMES,
@@ -216,9 +217,7 @@ function OpenPositions(p) {
                       {remainingQty}
                       {exitQty > 0 && <span className="v3-read"> of {totalQty}</span>}
                     </td>
-                    <td className="r v3-mono">
-                      ${avgEntry.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </td>
+                    <td className="r v3-mono">{fmtPrice(avgEntry, pos)}</td>
                     <td className="r">
                       <button
                         type="button"
@@ -258,7 +257,7 @@ function OpenPositions(p) {
             </div>
             <div>
               <label className="field-label" htmlFor="close-price">Exit price</label>
-              <input id="close-price" type="number" step="0.01" placeholder="0.00" value={closePrice}
+              <input id="close-price" type="number" step={priceStep(closingPos.instrument_type, closingPos.ticker)} placeholder="0.00" value={closePrice}
                 onChange={(e) => setClosePrice(e.target.value)} style={{ width: 118 }}
                 onKeyDown={(e) => e.key === 'Enter' && handleClosePosition()} />
             </div>

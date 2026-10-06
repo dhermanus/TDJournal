@@ -162,8 +162,8 @@ function MatchReview({ ta, tradeGroup, confidence, onChange }) {
           </label>
           <label style={fieldLabel}>
             Stop Loss ($)
-            <input type="number" step="0.01" className="input" value={form.stop_loss}
-              onChange={e => setForm(f => ({ ...f, stop_loss: e.target.value }))} />
+            {/* step="any": this form carries no instrument, so there is no precision to infer — a fixed step would reject an FX stop outright. */}
+            <input type="number" step="any" className="input" value={form.stop_loss} onChange={e => setForm(f => ({ ...f, stop_loss: e.target.value }))} />
           </label>
           <label style={fieldLabel}>
             Emotional State

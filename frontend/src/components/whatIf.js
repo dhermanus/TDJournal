@@ -30,7 +30,7 @@
 // only, exactly as the chart applies it, and a day or week boundary is derived
 // from an epoch with UTC getters — the same thing TradingChart does.
 import { toTs, execToTs } from './chartTime';
-import { isPriceDeltaLinear, priceDecimals } from '../instruments';
+import { isPriceDeltaLinear } from '../instruments';
 
 export const SCENARIOS = [
   { label: '+5 min',      kind: 'offset', minutes: 5 },
@@ -151,7 +151,3 @@ export function computeWhatIf(bars, stats, trade, source) {
     };
   });
 }
-
-/** Quote decimals for a price, so five-digit FX stops collapsing into cents. */
-export const scenarioPrice = (price, trade) =>
-  price == null ? '—' : `$${price.toFixed(priceDecimals(trade.instrument_type, trade.ticker))}`;

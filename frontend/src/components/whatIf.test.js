@@ -21,7 +21,8 @@
 // from that formula rather than typed as constants: the first draft asserted
 // hand-computed numbers and the arithmetic did not match the fixture, which
 // failed the suite without telling us anything about the feature.
-import { computeWhatIf, weekBounds, SCENARIOS, scenarioPrice } from './whatIf';
+import { computeWhatIf, weekBounds, SCENARIOS } from './whatIf';
+import { fmtPrice as scenarioPrice } from '../instruments';
 
 const iso = (d, hhmmss) => Math.floor(new Date(`${d}T${hhmmss}Z`).getTime() / 1000);
 
