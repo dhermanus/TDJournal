@@ -1,12 +1,12 @@
-fastapi==0.141.1
-uvicorn[standard]==0.53.0
+fastapi==0.142.4
+uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 aiofiles==24.1.0
 httpx==0.28.1
 anthropic>=0.43.0
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 tzdata>=2024.1
 # Schema migrations run at startup (dbmigration.py). sqlalchemy is declared
 # because migrations/env.py imports it directly, not only through alembic.
 alembic==1.20.0
-sqlalchemy==2.0.54
+sqlalchemy==2.1.4
